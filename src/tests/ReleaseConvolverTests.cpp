@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -143,6 +144,31 @@ bool BankMatchesDirect() {
     return ok;
 }
 
+// The AVX products and butterflies give the scalar loops' bits (renders do not depend on the CPU).
+bool AvxMatchesScalar() {
+    if (!svms::bus::BusAvx()) { std::printf("SKIP avx equals scalar: no AVX\n"); return true; }
+    const int block = 64, blocks = 120, frames = block * blocks, length = 64 * 45 + 17;
+    const Kernel kern = RandomKernel(length, 50);
+    const std::vector<float> x = RandomInput(frames, 51);
+    std::vector<float> out[2];
+    for (int pass = 0; pass < 2; ++pass) {
+        svms::bus::busScalarOnly = pass == 1;
+        const ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, 3);
+        svms::bus::ConvBank bank;
+        bank.Prepare(block, 3);
+        const int id = bank.Add(k);
+        out[pass].assign(static_cast<size_t>(2 * frames), 0.0f);
+        for (int b = 0; b < blocks; ++b) {
+            std::memcpy(bank.InputBlock(id), &x[static_cast<size_t>(b * block)], sizeof(float) * block);
+            bank.Process(&out[pass][static_cast<size_t>(b * block)], &out[pass][static_cast<size_t>(frames + b * block)]);
+        }
+    }
+    svms::bus::busScalarOnly = false;
+    const bool ok = std::memcmp(out[0].data(), out[1].data(), sizeof(float) * out[0].size()) == 0;
+    std::printf("%s avx equals scalar: kernel and bank output bit for bit\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 // The work of the long partitions is spread: no block does much more than the average.
 bool EvenWork() {
     const int block = 1024, length = 240000;
@@ -183,10 +209,39 @@ void Bench() {
                 audio / s);
 }
 
+// A bank at the load of one DYHTM shard: 210 inputs on 5 s kernels, each taking a note in about one block in four.
+// Informational: time per second of 48 kHz output.
+void BenchBank(int kernels, int levels) {
+    const int block = 1024, length = 240000, inputs = 210, blocks = 1000;
+    std::vector<ConvKernel> k;
+    for (int i = 0; i < kernels; ++i) {
+        const Kernel kern = RandomKernel(length, 40u + i);
+        k.push_back(MakeKernel(kern.l.data(), kern.r.data(), length, block, levels));
+    }
+    svms::bus::ConvBank bank;
+    bank.Prepare(block, levels);
+    std::vector<int> id;
+    for (int i = 0; i < inputs; ++i) id.push_back(bank.Add(k[static_cast<size_t>(i % kernels)]));
+    std::mt19937 rng(5);
+    std::uniform_int_distribution<int> when(0, 4 * block - 1);
+    std::vector<float> l(static_cast<size_t>(block)), r(static_cast<size_t>(block));
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int b = 0; b < blocks; ++b) {
+        for (int i = 0; i < inputs; ++i) {
+            const int at = when(rng);
+            if (at < block) bank.InputBlock(id[static_cast<size_t>(i)])[at] = 0.5f;
+        }
+        bank.Process(l.data(), r.data());
+    }
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("bank bench: %d inputs, %.0f ms per second of audio\n", inputs, 1000.0 * s / (double(blocks) * block / 48000.0));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc > 1 && !std::strcmp(argv[1], "--bench")) { Bench(); return 0; }
+    if (argc > 1 && !std::strcmp(argv[1], "--bench-bank")) { BenchBank(argc > 2 ? std::atoi(argv[2]) : 8, argc > 3 ? std::atoi(argv[3]) : 3); return 0; }
     bool ok = true;
     ok &= MatchesDirect(64, 10, 3, 20, 1, "shorter than a block");
     ok &= MatchesDirect(64, 64 * 8, 3, 40, 2, "level 0 only");
@@ -196,6 +251,7 @@ int main(int argc, char** argv) {
     ok &= MatchesDirect(64, 64 * 45 + 17, 1, 120, 6, "one uniform level");
     ok &= ZeroLatency();
     ok &= BankMatchesDirect();
+    ok &= AvxMatchesScalar();
     ok &= EvenWork();
     std::printf(ok ? "all release convolver tests passed\n" : "release convolver tests FAILED\n");
     return ok ? 0 : 1;

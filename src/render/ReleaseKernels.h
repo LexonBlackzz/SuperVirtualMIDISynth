@@ -255,6 +255,7 @@ public:
 
     size_t Bytes() const noexcept { return bytes_.load(std::memory_order_relaxed); }
     uint32_t Refused() const noexcept { return refused_.load(std::memory_order_relaxed); }
+    uint64_t BuildNs() const noexcept { return buildNs_.load(std::memory_order_relaxed); }
 
 private:
     static constexpr uint32_t kSlots = 1u << 16, kMaxProbe = 64u, kRing = 4096u;
@@ -285,6 +286,11 @@ private:
     }
 
     void Build(Slot& s) {
+        const auto t0 = std::chrono::steady_clock::now();
+        struct Timer {
+            std::atomic<uint64_t>& ns; std::chrono::steady_clock::time_point t0;
+            ~Timer() { ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed); }
+        } timer{buildNs_, t0};
         std::vector<KernelSource> src;
         const uint64_t key = s.key.load(std::memory_order_relaxed) - 1u;
         if (!source_(key, src) || SetRefusal(src)) return Refuse(s);
@@ -317,6 +323,7 @@ private:
     uint32_t used_ = 0;                          // slots taken (caller thread)
     std::atomic<uint32_t> queued_{0}, done_{0}, refused_{0};
     std::atomic<size_t> bytes_{0};
+    std::atomic<uint64_t> buildNs_{0};
     std::vector<std::shared_ptr<const SplitFft>> ffts_;   // builder thread
     std::atomic<bool> running_{false};
     bool background_ = true;

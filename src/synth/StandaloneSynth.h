@@ -382,6 +382,9 @@ public:
     uint64_t ReleaseBusNotes() const { return busNotes_; }
     size_t ReleaseBusHistories() const { return bus_.Histories(); }
     size_t ReleaseBusKernelBytes() const { return busKernels_.Bytes(); }
+    double BusMsPerSecond(uint64_t ns) const {
+        return bus_.Blocks() ? ns / 1e6 / (double(bus_.Blocks()) * busBlock_ / rate_) : 0.0;
+    }
 
     ~StandaloneSynth() {
 #if defined(SVMS_GPU_STAGE)
@@ -389,11 +392,13 @@ public:
 #endif
         if (busOn_)
             std::fprintf(stderr, "[SVMS] release bus: %llu of %llu notes, %.1f MB of kernels, %u regions refused, "
-                         "%.0f convolutions per block, %.0f ms per audio second\n",
+                         "%.0f convolutions per block; ms per audio second: %.0f convolving, %.0f mixing, "
+                         "%.0f planning, %.0f building kernels\n",
                          (unsigned long long)busNotes_, (unsigned long long)noteCalls_,
                          busKernels_.Bytes() / 1e6, busKernels_.Refused(),
                          bus_.Blocks() ? double(bus_.Convolved()) / double(bus_.Blocks()) : 0.0,
-                         bus_.Blocks() ? bus_.BusNs() / 1e6 / (double(bus_.Blocks()) * busBlock_ / rate_) : 0.0);
+                         BusMsPerSecond(bus_.BusNs()), BusMsPerSecond(busRenderNs_ - bus_.BusNs()),
+                         BusMsPerSecond(busPlanNs_), BusMsPerSecond(busKernels_.BuildNs()));
         // Opt-in end-of-session diagnostic: every plan refusal is a skipped
         // stretch (silence), so a real file should report zero.
         if (std::getenv("SVMS_REPORT_REFUSALS") != nullptr) {
@@ -532,7 +537,11 @@ public:
                                   sampleFrames_, left, right,
                                   frameCount, cfg_, nullptr, 0, true,
                                   absoluteFrame);
-            if (busOn_) bus_.Render(left, right, frameCount, absoluteFrame);
+            if (busOn_) {
+                const auto busT0 = std::chrono::steady_clock::now();
+                bus_.Render(left, right, frameCount, absoluteFrame);
+                busRenderNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busT0).count());
+            }
             if (!rawMix_) PostProcess(left, right, frameCount);
         }
     }
@@ -667,7 +676,11 @@ public:
             mergedNoteOns_ += folded;
             events = mergeScratch_.data();
         }
-        if (busOn_) BusPlan(events, eventCount, absoluteFrame);
+        if (busOn_) {
+            const auto busT0 = std::chrono::steady_clock::now();
+            BusPlan(events, eventCount, absoluteFrame);
+            busPlanNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busT0).count());
+        }
 #if defined(_MSC_VER)
         const uint64_t renderBegin = __rdtsc();
 #endif
@@ -681,7 +694,9 @@ public:
 #endif
         if (busOn_) {
             busPlan_.clear();
+            const auto busT0 = std::chrono::steady_clock::now();
             bus_.Render(left, right, frameCount, absoluteFrame);
+            busRenderNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busT0).count());
         }
         if (!rawMix_) PostProcess(left, right, frameCount);
     }
@@ -1824,6 +1839,7 @@ private:
     std::vector<BusPair> busPlan_;
     std::vector<uint32_t> keyHeld_;
     std::vector<uint64_t> busOff_;
+    uint64_t busPlanNs_ = 0, busRenderNs_ = 0;   // report only
     std::vector<std::vector<uint32_t>> busSets_;           // set id -> its regions (bank-local indices)
     std::map<std::vector<uint32_t>, uint32_t> busSetIds_;  // regions -> set id
     std::unordered_map<uint64_t, uint32_t> busSetOf_;      // font, preset, key, velocity -> set id

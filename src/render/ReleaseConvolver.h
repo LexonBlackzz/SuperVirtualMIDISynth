@@ -23,24 +23,106 @@
 #include <memory>
 #include <vector>
 
+#if (defined(_M_X64) || defined(__x86_64__)) && !defined(SVMS_XP_COMPAT)
+#define SVMS_BUS_AVX 1
+#include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define SVMS_BUS_AVX_FN
+#else
+#include <cpuid.h>
+#define SVMS_BUS_AVX_FN __attribute__((target("avx")))
+#endif
+#endif
+
 namespace svms {
 namespace bus {
 
 using Cf = std::complex<float>;
 
-// Radix-2 complex FFT, unnormalized, whose passes can run one at a time: pass 0 is the bit-reversal permutation,
-// pass s (1..Bits) the butterflies of span 2^s.
+// AVX paths for the complex products and butterflies. They do the same IEEE operations as the scalar loops (no
+// FMA), so both give the same bits. Tests set busScalarOnly to compare.
+inline bool busScalarOnly = false;
+inline bool BusAvx() noexcept {
+#if defined(SVMS_BUS_AVX)
+    if (busScalarOnly) return false;
+    static const bool has = [] {
+        unsigned int ecx = 0;
+#if defined(_MSC_VER)
+        int r[4];
+        __cpuid(r, 1);
+        ecx = static_cast<unsigned int>(r[2]);
+#else
+        unsigned int a = 0, b = 0, d = 0;
+        if (!__get_cpuid(1, &a, &b, &ecx, &d)) return false;
+#endif
+        if ((ecx & (1u << 27)) == 0 || (ecx & (1u << 28)) == 0) return false;   // OSXSAVE, AVX
+#if defined(_MSC_VER)
+        return (_xgetbv(0) & 6u) == 6u;
+#else
+        unsigned int lo = 0, hi = 0;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        return (lo & 6u) == 6u;
+#endif
+    }();
+    return has;
+#else
+    return false;
+#endif
+}
+
+// acc (=, or += when `add`) x * h, element-wise over `count` complex values (interleaved floats).
+inline void MulScalar(float* acc, const float* x, const float* h, int count, bool add) noexcept {
+    if (add) {
+        for (int i = 0; i < count; ++i) {
+            acc[2 * i] += x[2 * i] * h[2 * i] - x[2 * i + 1] * h[2 * i + 1];
+            acc[2 * i + 1] += x[2 * i] * h[2 * i + 1] + x[2 * i + 1] * h[2 * i];
+        }
+    } else {
+        for (int i = 0; i < count; ++i) {
+            acc[2 * i] = x[2 * i] * h[2 * i] - x[2 * i + 1] * h[2 * i + 1];
+            acc[2 * i + 1] = x[2 * i] * h[2 * i + 1] + x[2 * i + 1] * h[2 * i];
+        }
+    }
+}
+
+#if defined(SVMS_BUS_AVX)
+// x * h for four complex values: (xr hr - xi hi, xi hr + xr hi).
+SVMS_BUS_AVX_FN inline __m256 MulAvx4(__m256 x, __m256 h) noexcept {
+    return _mm256_addsub_ps(_mm256_mul_ps(x, _mm256_moveldup_ps(h)),
+                            _mm256_mul_ps(_mm256_permute_ps(x, 0xB1), _mm256_movehdup_ps(h)));
+}
+SVMS_BUS_AVX_FN inline void MulAvx(float* acc, const float* x, const float* h, int count, bool add) noexcept {
+    int i = 0;
+    for (; i + 4 <= count; i += 4) {
+        __m256 p = MulAvx4(_mm256_loadu_ps(x + 2 * i), _mm256_loadu_ps(h + 2 * i));
+        if (add) p = _mm256_add_ps(_mm256_loadu_ps(acc + 2 * i), p);
+        _mm256_storeu_ps(acc + 2 * i, p);
+    }
+    MulScalar(acc + 2 * i, x + 2 * i, h + 2 * i, count - i, add);
+}
+#endif
+
+inline void Mul(float* acc, const float* x, const float* h, int count, bool add) noexcept {
+#if defined(SVMS_BUS_AVX)
+    if (BusAvx()) return MulAvx(acc, x, h, count, add);
+#endif
+    MulScalar(acc, x, h, count, add);
+}
+
+// Radix-2 complex FFT, unnormalized, whose passes can run one at a time. Spectra are kept in bit-reversed bin
+// order: the forward transform (decimation in frequency) takes natural input and leaves bin rev(p) at position p,
+// the inverse (decimation in time) takes that order back to natural output. Everything between them is
+// element-wise, so no permutation is ever done. Pass 0 is empty (it keeps the pass count of a permuting FFT);
+// passes 1..Bits are the butterflies, forward from span n down to 2, inverse from 2 up to n.
+//
+// In that order the bins of a real signal's partners (bin -k for bin k) are mirrored within each octave of
+// positions: Partner(p) = 3 * 2^m - 1 - p for p in [2^m, 2^(m+1)), and positions 0 and 1 are their own.
 class SplitFft {
 public:
     explicit SplitFft(int n) : n_(n) {
         while ((1 << bits_) < n_) ++bits_;
-        rev_.resize(static_cast<size_t>(n_));
-        for (int i = 0; i < n_; ++i) {
-            int r = 0;
-            for (int b = 0; b < bits_; ++b) if (i & (1 << b)) r |= 1 << (bits_ - 1 - b);
-            rev_[static_cast<size_t>(i)] = r;
-        }
-        tw_.resize(static_cast<size_t>((std::max)(1, n_ - 1)));   // pass s: 2^(s-1) twiddles at offset 2^(s-1) - 1
+        tw_.resize(static_cast<size_t>((std::max)(1, n_ - 1)));   // span 2h: h twiddles at offset h - 1
         for (int s = 1; s <= bits_; ++s) {
             const int half = 1 << (s - 1);
             for (int k = 0; k < half; ++k)
@@ -53,38 +135,113 @@ public:
     int Bits() const noexcept { return bits_; }
 
     void Pass(Cf* x, int s, bool inverse) const noexcept {
-        if (s == 0) {
-            for (int i = 0; i < n_; ++i) {
-                const int j = rev_[static_cast<size_t>(i)];
-                if (j > i) std::swap(x[i], x[j]);
-            }
-            return;
-        }
-        const int half = 1 << (s - 1), len = half << 1;
-        const Cf* w = &tw_[static_cast<size_t>(half - 1)];
+        if (s == 0) return;
+        const int half = inverse ? 1 << (s - 1) : 1 << (bits_ - s), len = half << 1;
         float* f = reinterpret_cast<float*>(x);
-        const float* wf = reinterpret_cast<const float*>(w);
+        const float* wf = reinterpret_cast<const float*>(&tw_[static_cast<size_t>(half - 1)]);
+#if defined(SVMS_BUS_AVX)
+        if (n_ >= 8 && BusAvx()) return half >= 4 ? PassAvx(f, wf, half, inverse) : PassAvxSmall(f, wf, half, inverse);
+#endif
         const float sign = inverse ? -1.0f : 1.0f;
         for (int i = 0; i < n_; i += len) {
             float* a = f + 2 * i;
             float* b = f + 2 * (i + half);
             for (int k = 0; k < half; ++k) {
                 const float wr = wf[2 * k], wi = sign * wf[2 * k + 1];
-                const float br = b[2 * k] * wr - b[2 * k + 1] * wi;
-                const float bi = b[2 * k] * wi + b[2 * k + 1] * wr;
                 const float ar = a[2 * k], ai = a[2 * k + 1];
-                a[2 * k] = ar + br; a[2 * k + 1] = ai + bi;
-                b[2 * k] = ar - br; b[2 * k + 1] = ai - bi;
+                if (inverse) {   // a + b w, a - b w
+                    const float br = b[2 * k] * wr - b[2 * k + 1] * wi;
+                    const float bi = b[2 * k] * wi + b[2 * k + 1] * wr;
+                    a[2 * k] = ar + br; a[2 * k + 1] = ai + bi;
+                    b[2 * k] = ar - br; b[2 * k + 1] = ai - bi;
+                } else {         // a + b, (a - b) w
+                    const float dr = ar - b[2 * k], di = ai - b[2 * k + 1];
+                    a[2 * k] = ar + b[2 * k]; a[2 * k + 1] = ai + b[2 * k + 1];
+                    b[2 * k] = dr * wr - di * wi;
+                    b[2 * k + 1] = dr * wi + di * wr;
+                }
             }
         }
     }
     void Run(Cf* x, bool inverse) const noexcept {
-        for (int s = 0; s <= bits_; ++s) Pass(x, s, inverse);
+        for (int s = 1; s <= bits_; ++s) Pass(x, s, inverse);
+    }
+
+    static int Partner(int p) noexcept {
+        if (p < 2) return p;
+        int lo = 2;
+        while (lo * 2 <= p) lo <<= 1;
+        return 3 * lo - 1 - p;
     }
 
 private:
+#if defined(SVMS_BUS_AVX)
+    // One butterfly of either kind on four lanes; the scalar loop's arithmetic.
+    SVMS_BUS_AVX_FN static void Butterfly(__m256& a, __m256& b, __m256 w, bool inverse) noexcept {
+        if (inverse) {
+            const __m256 bw = MulAvx4(b, w);
+            b = _mm256_sub_ps(a, bw);
+            a = _mm256_add_ps(a, bw);
+        } else {
+            const __m256 d = _mm256_sub_ps(a, b);
+            a = _mm256_add_ps(a, b);
+            b = MulAvx4(d, w);
+        }
+    }
+    SVMS_BUS_AVX_FN static __m256 Twiddle(const float* wf, bool inverse) noexcept {
+        const __m256 w = _mm256_loadu_ps(wf);
+        return inverse ? _mm256_xor_ps(w, _mm256_setr_ps(0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f)) : w;
+    }
+    // Spans of 8 and more, four butterflies at a time.
+    SVMS_BUS_AVX_FN void PassAvx(float* f, const float* wf, int half, bool inverse) const noexcept {
+        const int len = half << 1;
+        for (int i = 0; i < n_; i += len) {
+            float* a = f + 2 * i;
+            float* b = f + 2 * (i + half);
+            for (int k = 0; k < half; k += 4) {
+                __m256 av = _mm256_loadu_ps(a + 2 * k), bv = _mm256_loadu_ps(b + 2 * k);
+                Butterfly(av, bv, Twiddle(wf + 2 * k, inverse), inverse);
+                _mm256_storeu_ps(a + 2 * k, av);
+                _mm256_storeu_ps(b + 2 * k, bv);
+            }
+        }
+    }
+    // Spans of 2 and 4: eight values at a time, regrouped so each lane pairs an a with its b.
+    SVMS_BUS_AVX_FN void PassAvxSmall(float* f, const float* wf, int half, bool inverse) const noexcept {
+        __m256 w;
+        if (half == 1) {
+            w = _mm256_castpd_ps(_mm256_broadcast_sd(reinterpret_cast<const double*>(wf)));
+        } else {
+            const __m128 w2 = _mm_loadu_ps(wf);
+            w = _mm256_insertf128_ps(_mm256_castps128_ps256(w2), w2, 1);
+        }
+        if (inverse) w = _mm256_xor_ps(w, _mm256_setr_ps(0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f));
+        for (int i = 0; i < n_; i += 8) {
+            const __m256 v0 = _mm256_loadu_ps(f + 2 * i), v1 = _mm256_loadu_ps(f + 2 * i + 8);
+            __m256 a, b;
+            if (half == 1) {   // pairs (0 1) (2 3) | (4 5) (6 7): a = [0 4 2 6], b = [1 5 3 7]
+                a = _mm256_castpd_ps(_mm256_shuffle_pd(_mm256_castps_pd(v0), _mm256_castps_pd(v1), 0x0));
+                b = _mm256_castpd_ps(_mm256_shuffle_pd(_mm256_castps_pd(v0), _mm256_castps_pd(v1), 0xF));
+            } else {           // quads (0 1 | 2 3) (4 5 | 6 7): a = [0 1 4 5], b = [2 3 6 7]
+                a = _mm256_permute2f128_ps(v0, v1, 0x20);
+                b = _mm256_permute2f128_ps(v0, v1, 0x31);
+            }
+            Butterfly(a, b, w, inverse);
+            __m256 o0, o1;
+            if (half == 1) {
+                o0 = _mm256_castpd_ps(_mm256_shuffle_pd(_mm256_castps_pd(a), _mm256_castps_pd(b), 0x0));
+                o1 = _mm256_castpd_ps(_mm256_shuffle_pd(_mm256_castps_pd(a), _mm256_castps_pd(b), 0xF));
+            } else {
+                o0 = _mm256_permute2f128_ps(a, b, 0x20);
+                o1 = _mm256_permute2f128_ps(a, b, 0x31);
+            }
+            _mm256_storeu_ps(f + 2 * i, o0);
+            _mm256_storeu_ps(f + 2 * i + 8, o1);
+        }
+    }
+#endif
+
     int n_ = 0, bits_ = 0;
-    std::vector<int> rev_;
     std::vector<Cf> tw_;
 };
 
@@ -93,7 +250,7 @@ struct ConvLevel {
     int offsetBlocks = 0;     // where in the kernel the level starts
     int parts = 0;
     std::shared_ptr<const SplitFft> fft;   // 2 * m * block points
-    std::vector<Cf> h;        // parts x 2N spectra of (left + i * right)
+    std::vector<Cf> h;        // parts x 2N spectra of (left + i * right), bins bit-reversed (SplitFft)
 };
 
 struct ConvKernel {
@@ -163,8 +320,8 @@ public:
             s.fdl.assign(static_cast<size_t>(L.parts) * static_cast<size_t>(size), Cf(0.0f, 0.0f));
             s.acc.assign(static_cast<size_t>(size), Cf(0.0f, 0.0f));
             s.out.assign(static_cast<size_t>(4 * n), 0.0f);   // [parity][side][n]
-            // Work units in order: input copy + bit reversal, forward passes, one product per partition,
-            // inverse bit reversal + passes, output write. Each gets the step its cost midpoint falls in.
+            // Work units in order: input copy (with the empty pass 0), forward passes, one product per partition,
+            // the inverse's empty pass 0 and its passes, output write. Each gets the step its cost midpoint falls in.
             s.unitFlops.clear();
             const int bits = L.fft->Bits();
             for (int p = 0; p <= bits; ++p) s.unitFlops.push_back(p == 0 ? 0.0 : PassFlops(size));
@@ -298,9 +455,14 @@ private:
 };
 
 // Many inputs, each against its own kernel, summed into one output (one MIDI channel of the release bus). The sum
-// is linear, so each level adds every input's spectrum products into one accumulator and runs one inverse FFT for
-// all of them. An input whose two chunks under a spectrum are silent has no spectrum: its forward FFT and products
-// are skipped. Kernels must share the block size and the level layout of MakeKernel (1, 4, 16, ... blocks).
+// is linear, so all inputs share each level's output spectra and one inverse FFT per output chunk.
+//
+// Scatter form: when an input's spectrum X_j is complete, its products X_j H_p go at once into the output
+// spectra they belong to (output chunk j + lag + p), a ring of accumulators per level. Each spectrum is read once,
+// while it is in cache, and no input keeps a history of spectra. The products run over tiles of bins, so a tile
+// of every pending output stays in cache across the inputs. An input silent in a chunk has no spectrum then: its
+// forward FFT and products are skipped. Kernels must share the block size and the level layout of MakeKernel
+// (1, 4, 16, ... blocks).
 //
 // Offline form: a level's work runs whole at the block where its input chunk completes, so a block carries the
 // whole FFT of every level that ends there. (ConvHistory spreads it; the live bus will need that.)
@@ -314,12 +476,13 @@ public:
             L.m = m;
             L.size = 2 * m * block;
             L.fft = std::make_shared<const SplitFft>(L.size);
-            L.acc.assign(static_cast<size_t>(L.size), Cf(0.0f, 0.0f));
+            L.z.assign(static_cast<size_t>(L.size), Cf(0.0f, 0.0f));
+            L.ga = L.gb = L.z;
             L.out.assign(static_cast<size_t>(4 * m * block), 0.0f);
             levels_.push_back(std::move(L));
         }
         ring_ = 1;
-        while (ring_ < 4 * 2 * levels_.back().m * block) ring_ <<= 1;
+        while (ring_ < 4 * levels_.back().m * block) ring_ <<= 1;   // a level reads its last whole chunk
         inputs_.clear();
         free_.clear();
         blockIndex_ = 0;
@@ -336,30 +499,36 @@ public:
         in.ring.assign(static_cast<size_t>(ring_), 0.0f);
         in.block.assign(static_cast<size_t>(block_), 0.0f);
         in.loud.assign(static_cast<size_t>(ring_ / block_), 0u);
-        in.fdl.resize(k.levels.size());
-        in.live.resize(k.levels.size());
+        in.x.resize(k.levels.size());
+        in.prev.resize(k.levels.size());
+        in.xLive.assign(k.levels.size(), 0u);
+        in.prevLive.assign(k.levels.size(), 0u);
         for (size_t lv = 0; lv < k.levels.size(); ++lv) {
-            const ConvLevel& L = k.levels[lv];
-            in.fdl[lv].assign(static_cast<size_t>(L.parts) * static_cast<size_t>(2 * L.m * block_), Cf(0.0f, 0.0f));
-            in.live[lv].assign(static_cast<size_t>(L.parts), 0u);
+            const size_t size = static_cast<size_t>(2 * k.levels[lv].m * block_);
+            in.x[lv].assign(size, Cf(0.0f, 0.0f));
+            in.prev[lv].assign(size, Cf(0.0f, 0.0f));
         }
         in.used = true;
         ++used_;
         return id;
     }
 
+    // An input's products already made stay in the outputs: its tail plays on.
     void Remove(int id) {
         Input& in = inputs_[static_cast<size_t>(id)];
         if (!in.used) return;
         in = Input{};
         free_.push_back(id);
-        // With no input left, an output chunk computed ahead belongs to removed (or cut) inputs: drop it.
-        if (--used_ == 0)
-            for (Level& L : levels_) L.outLive[0] = L.outLive[1] = false;
+        --used_;
     }
 
+    // Every input and every pending output (all sound off).
     void RemoveAll() {
         for (size_t i = 0; i < inputs_.size(); ++i) if (inputs_[i].used) Remove(static_cast<int>(i));
+        for (Level& L : levels_) {
+            L.outLive[0] = L.outLive[1] = false;
+            std::fill(L.accLive.begin(), L.accLive.end(), 0u);
+        }
     }
 
     // This block's input for `id`, block frames; cleared by Process.
@@ -389,32 +558,15 @@ public:
             const uint64_t m = static_cast<uint64_t>(L.m);
             const int n = L.m * block_;
             if (lv == 0) {
-                // Output chunk b = sum_p X_{b - p} H_p, all in this block.
-                if (Chunk(lv, static_cast<int64_t>(b), static_cast<int64_t>(b), mask, blocksInRing)) {
-                    const float scale = 1.0f / static_cast<float>(L.size);
-                    for (int i = 0; i < n; ++i) {
-                        outL[i] += L.acc[static_cast<size_t>(n + i)].real() * scale;
-                        outR[i] += L.acc[static_cast<size_t>(n + i)].imag() * scale;
-                    }
-                    any = true;
-                }
+                // Output chunk b: X_b H_0 now, the rest made in earlier blocks.
+                any = Chunk(lv, static_cast<int64_t>(b), 0, mask, blocksInRing, outL, outR, true) || any;
                 continue;
             }
             if (b % m == 0u) {
-                // Chunk c starts: X_{c-1} is complete, and output chunk c + 1 = sum_p X_{c - 1 - p} H_p.
+                // Chunk c starts: X_{c-1} is complete, and so is output chunk c + 1.
                 const int64_t c = static_cast<int64_t>(b / m);
                 float* oL = &L.out[static_cast<size_t>((c + 1) & 1) * 2 * static_cast<size_t>(n)];
-                float* oR = oL + n;
-                if (Chunk(lv, c - 1, c + 1, mask, blocksInRing)) {
-                    const float scale = 1.0f / static_cast<float>(L.size);
-                    for (int i = 0; i < n; ++i) {
-                        oL[i] = L.acc[static_cast<size_t>(n + i)].real() * scale;
-                        oR[i] = L.acc[static_cast<size_t>(n + i)].imag() * scale;
-                    }
-                    L.outLive[(c + 1) & 1] = true;
-                } else {
-                    L.outLive[(c + 1) & 1] = false;
-                }
+                L.outLive[(c + 1) & 1] = Chunk(lv, c - 1, 2, mask, blocksInRing, oL, oL + n, false);
             }
             const int64_t c = static_cast<int64_t>(b / m);
             if (L.outLive[c & 1]) {
@@ -429,71 +581,161 @@ public:
     }
 
 private:
+    static constexpr int kTile = 1024;   // bins per product tile
+
     struct Input {
         const ConvKernel* k = nullptr;
         std::vector<float> ring, block;
-        std::vector<uint8_t> loud;               // per block in the ring: any non-zero input
-        std::vector<std::vector<Cf>> fdl;        // per level: parts x 2N spectra
-        std::vector<std::vector<uint8_t>> live;  // per level and part slot: the spectrum is non-zero
+        std::vector<uint8_t> loud;            // per block in the ring: any non-zero input
+        std::vector<std::vector<Cf>> x, prev; // per level: X_j (when xLive), G of the last chunk (when prevLive)
+        std::vector<uint8_t> xLive, prevLive;
         bool used = false;
     };
     struct Level {
         int m = 1, size = 0;
         std::shared_ptr<const SplitFft> fft;
-        std::vector<Cf> acc;
-        std::vector<float> out;   // [parity][side][N], levels >= 1
+        std::vector<Cf> z, ga, gb;
+        std::vector<std::vector<Cf>> acc;   // output spectra, chunk t in slot t % acc.size()
+        std::vector<uint8_t> accLive;       // the slot holds products (else its contents are stale)
+        std::vector<float> out;             // [parity][side][N], levels >= 1
         bool outLive[2] = {false, false};
     };
 
-    // Transforms every input's X_j (input chunks j - 1 and j) and sums X_{t - lag - p} H_p into the level's
-    // accumulator, then inverts it. False if nothing contributed (the accumulator is not touched then).
-    bool Chunk(size_t lv, int64_t j, int64_t t, uint64_t mask, uint64_t blocksInRing) {
+    // X_j of input `in`, from G_j = g (nullptr: chunk j silent): X_j = G_{j-1} + (-1)^k G_j, as chunk j sits in
+    // the second half of X_j's window. Bins are bit-reversed (SplitFft), so the even bins fill the first half of
+    // the positions and the odd ones the second. Keeps G_j for X_{j+1}.
+    static void Fold(Input& in, size_t lv, int size, const Cf* g) {
+        Cf* x = in.x[lv].data();
+        Cf* prev = in.prev[lv].data();
+        const bool had = in.prevLive[lv] != 0;
+        const int h = size / 2;
+        in.xLive[lv] = had || g;
+        in.prevLive[lv] = g != nullptr;
+        if (!g) {
+            if (had) std::memcpy(x, prev, sizeof(Cf) * static_cast<size_t>(size));
+            return;
+        }
+        if (had) {
+            for (int k = 0; k < h; ++k) x[k] = prev[k] + g[k];
+            for (int k = h; k < size; ++k) x[k] = prev[k] - g[k];
+        } else {
+            for (int k = 0; k < h; ++k) x[k] = g[k];
+            for (int k = h; k < size; ++k) x[k] = -g[k];
+        }
+        std::memcpy(prev, g, sizeof(Cf) * static_cast<size_t>(size));
+    }
+
+    // At least `need` accumulator slots; live ones keep their chunk (window [t, t + old size)).
+    static void Grow(Level& L, int64_t t, size_t need) {
+        const size_t old = L.acc.size();
+        if (old >= need) return;
+        std::vector<std::vector<Cf>> acc(need);
+        std::vector<uint8_t> live(need, 0u);
+        for (size_t s = 0; s < old; ++s) {
+            if (!L.accLive[s]) continue;
+            const int64_t ahead = ((static_cast<int64_t>(s) - t) % static_cast<int64_t>(old) + static_cast<int64_t>(old)) %
+                                  static_cast<int64_t>(old);
+            const size_t to = static_cast<size_t>((t + ahead) % static_cast<int64_t>(need));
+            acc[to].swap(L.acc[s]);
+            live[to] = 1u;
+        }
+        L.acc.swap(acc);
+        L.accLive.swap(live);
+    }
+
+    // Level lv at input chunk j: every input's X_j (input chunks j - 1 and j), its products into output chunks
+    // j + lag + p, then output chunk t = j + lag, inverted, into oL/oR (added if `add`). False if that chunk is
+    // silent (oL/oR untouched).
+    bool Chunk(size_t lv, int64_t j, int64_t lag, uint64_t mask, uint64_t blocksInRing, float* oL, float* oR, bool add) {
         Level& L = levels_[lv];
         const int n = L.m * block_, size = L.size;
-        const int64_t lag = t - j;
-        bool any = false;
-        for (Input& in : inputs_) {
+        const int64_t t = j + lag;
+        // G_j of every input loud in chunk j. The inputs are real, so two share one complex FFT (a + i b) and
+        // split by symmetry: G_a[k] = (Z[k] + conj Z[-k]) / 2, G_b[k] = (Z[k] - conj Z[-k]) / 2i.
+        loudIds_.clear();
+        for (size_t id = 0; id < inputs_.size(); ++id) {
+            Input& in = inputs_[id];
             if (!in.used || lv >= in.k->levels.size()) continue;
-            const ConvLevel& K = in.k->levels[lv];
-            const int64_t parts = K.parts;
-            // X_j: input frames [(j - 1) N, (j + 1) N), silent unless one of its blocks had input.
-            const int64_t slot = ((j % parts) + parts) % parts;
             bool loud = false;
-            for (int64_t bb = (j - 1) * L.m; bb < (j + 1) * L.m && !loud; ++bb)
+            for (int64_t bb = j * L.m; bb < (j + 1) * L.m && !loud; ++bb)
                 if (bb >= 0) loud = in.loud[static_cast<size_t>(static_cast<uint64_t>(bb) % blocksInRing)] != 0;
-            Cf* x = &in.fdl[lv][static_cast<size_t>(slot) * static_cast<size_t>(size)];
-            in.live[lv][static_cast<size_t>(slot)] = loud;
-            if (loud) {
-                const int64_t first = (j - 1) * n;
-                for (int i = 0; i < size; ++i) {
-                    const int64_t f = first + i;
-                    x[i] = Cf(f < 0 ? 0.0f : in.ring[static_cast<size_t>(static_cast<uint64_t>(f) & mask)], 0.0f);
-                }
-                L.fft->Run(x, false);
+            if (loud) loudIds_.push_back(static_cast<uint32_t>(id));
+            else Fold(in, lv, size, nullptr);
+        }
+        Cf* z = L.z.data();
+        Cf* ga = L.ga.data();
+        Cf* gb = L.gb.data();
+        for (size_t q = 0; q < loudIds_.size(); q += 2) {
+            Input& a = inputs_[loudIds_[q]];
+            Input* b = q + 1 < loudIds_.size() ? &inputs_[loudIds_[q + 1]] : nullptr;
+            const uint64_t first = static_cast<uint64_t>(j * n);   // j >= 0: chunk j had input
+            for (int i = 0; i < n; ++i) {
+                const size_t r = static_cast<size_t>((first + static_cast<uint64_t>(i)) & mask);
+                z[i] = Cf(a.ring[r], b ? b->ring[r] : 0.0f);
             }
+            std::fill(z + n, z + size, Cf(0.0f, 0.0f));
+            L.fft->Run(z, false);
+            if (!b) { Fold(a, lv, size, z); continue; }
+            // Bin -k of position p sits at SplitFft::Partner(p): mirrored within each octave of positions.
+            const auto split = [&](int p, int q) {
+                const Cf zk = z[p], zc = std::conj(z[q]);
+                ga[p] = 0.5f * (zk + zc);
+                const Cf d = zk - zc;
+                gb[p] = Cf(0.5f * d.imag(), -0.5f * d.real());
+            };
+            split(0, 0);
+            split(1, 1);
+            for (int lo = 2; lo < size; lo <<= 1)
+                for (int p = lo; p < 2 * lo; ++p) split(p, 3 * lo - 1 - p);
+            Fold(a, lv, size, ga);
+            Fold(*b, lv, size, gb);
+        }
+        // The products, scattered. Slots a product reaches for the first time start from zero.
+        liveIds_.clear();
+        size_t need = 1;
+        for (size_t id = 0; id < inputs_.size(); ++id) {
+            const Input& in = inputs_[id];
+            if (!in.used || lv >= in.k->levels.size() || !in.xLive[lv]) continue;
+            liveIds_.push_back(static_cast<uint32_t>(id));
+            need = (std::max)(need, static_cast<size_t>(in.k->levels[lv].parts));
+        }
+        Grow(L, t, need);
+        const int64_t slots = static_cast<int64_t>(L.acc.size());
+        for (const uint32_t id : liveIds_) {
+            const int64_t parts = inputs_[id].k->levels[lv].parts;
             for (int64_t p = 0; p < parts; ++p) {
-                const int64_t sj = (((t - lag - p) % parts) + parts) % parts;
-                if (!in.live[lv][static_cast<size_t>(sj)]) continue;
-                const float* xf = reinterpret_cast<const float*>(&in.fdl[lv][static_cast<size_t>(sj) * static_cast<size_t>(size)]);
-                const float* hf = reinterpret_cast<const float*>(&K.h[static_cast<size_t>(p) * static_cast<size_t>(size)]);
-                float* af = reinterpret_cast<float*>(L.acc.data());
-                if (!any) {
-                    for (int i = 0; i < size; ++i) {
-                        af[2 * i] = xf[2 * i] * hf[2 * i] - xf[2 * i + 1] * hf[2 * i + 1];
-                        af[2 * i + 1] = xf[2 * i] * hf[2 * i + 1] + xf[2 * i + 1] * hf[2 * i];
-                    }
-                    any = true;
-                } else {
-                    for (int i = 0; i < size; ++i) {
-                        af[2 * i] += xf[2 * i] * hf[2 * i] - xf[2 * i + 1] * hf[2 * i + 1];
-                        af[2 * i + 1] += xf[2 * i] * hf[2 * i + 1] + xf[2 * i + 1] * hf[2 * i];
-                    }
+                const size_t s = static_cast<size_t>((t + p) % slots);
+                if (L.accLive[s]) continue;
+                L.acc[s].assign(static_cast<size_t>(size), Cf(0.0f, 0.0f));
+                L.accLive[s] = 1u;
+            }
+        }
+        for (int k0 = 0; k0 < size; k0 += kTile) {
+            const int count = (std::min)(kTile, size - k0);
+            for (const uint32_t id : liveIds_) {
+                const Input& in = inputs_[id];
+                const ConvLevel& K = in.k->levels[lv];
+                const float* xf = reinterpret_cast<const float*>(in.x[lv].data() + k0);
+                for (int64_t p = 0; p < K.parts; ++p) {
+                    Cf* acc = L.acc[static_cast<size_t>((t + p) % slots)].data() + k0;
+                    const Cf* h = &K.h[static_cast<size_t>(p) * static_cast<size_t>(size) + static_cast<size_t>(k0)];
+                    Mul(reinterpret_cast<float*>(acc), xf, reinterpret_cast<const float*>(h), count, true);
                 }
             }
         }
-        if (any) L.fft->Run(L.acc.data(), true);
-        (void)n;
-        return any;
+        // Output chunk t is complete.
+        const size_t s = static_cast<size_t>(t % slots);
+        if (!L.accLive[s]) return false;
+        L.accLive[s] = 0u;
+        Cf* y = L.acc[s].data();
+        L.fft->Run(y, true);
+        const float scale = 1.0f / static_cast<float>(size);
+        if (add) {
+            for (int i = 0; i < n; ++i) { oL[i] += y[n + i].real() * scale; oR[i] += y[n + i].imag() * scale; }
+        } else {
+            for (int i = 0; i < n; ++i) { oL[i] = y[n + i].real() * scale; oR[i] = y[n + i].imag() * scale; }
+        }
+        return true;
     }
 
     int block_ = 0, ring_ = 1, used_ = 0;
@@ -501,7 +743,9 @@ private:
     std::vector<Level> levels_;
     std::vector<Input> inputs_;
     std::vector<int> free_;
+    std::vector<uint32_t> loudIds_, liveIds_;
 };
+
 
 }  // namespace bus
 }  // namespace svms
