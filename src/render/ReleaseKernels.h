@@ -14,7 +14,8 @@
 // region whose envelope ramps (delay, attack, or a decay to a sustain below full) is refused, as is one whose loop
 // ends at release (sampleModes 3). Such notes stay voices.
 //
-// The store builds kernels lazily on its own thread, under a memory budget. Get never blocks or allocates.
+// The store builds kernels lazily on its own thread, under a memory budget; in that mode Get never blocks or
+// allocates. Offline renders build inline instead, so the output does not depend on thread timing.
 
 #include "render/Envelope.h"
 #include "render/ReleaseConvolver.h"
@@ -162,8 +163,12 @@ public:
     ReleaseKernelStore& operator=(const ReleaseKernelStore&) = delete;
     ~ReleaseKernelStore() { Stop(); }
 
-    void Start(SourceFn source, uint32_t heldFrames, int block, size_t budgetBytes, int maxLevels = 3) {
+    // background: build on the store's own thread (Get returns nullptr until the kernel is ready). Without it Get
+    // builds a new kernel on the spot, so offline renders do not depend on thread timing.
+    void Start(SourceFn source, uint32_t heldFrames, int block, size_t budgetBytes, int maxLevels = 3,
+               bool background = true) {
         Stop();
+        background_ = background;
         source_ = std::move(source);
         heldFrames_ = heldFrames;
         block_ = block;
@@ -171,7 +176,7 @@ public:
         budget_ = budgetBytes;
         slots_.reset(new Slot[kSlots]);
         running_.store(true, std::memory_order_relaxed);
-        worker_ = std::thread([this] { Work(); });
+        if (background_) worker_ = std::thread([this] { Work(); });
     }
 
     // Joins the builder and frees every kernel. Call before the sample store changes, with no Get in flight.
@@ -191,7 +196,7 @@ public:
     }
 
     // The kernel if it is built, else nullptr; a key seen for the first time is queued for building.
-    // One caller thread at a time. Never blocks or allocates.
+    // One caller thread at a time. In background mode it never blocks or allocates.
     const ReleaseKernel* Get(uint64_t key) noexcept {
         if (!slots_) return nullptr;
         const uint64_t tag = key + 1u;
@@ -207,6 +212,10 @@ public:
             ++used_;
             s.state.store(kQueued, std::memory_order_relaxed);
             s.key.store(tag, std::memory_order_release);
+            if (!background_) {
+                Build(s);
+                return s.state.load(std::memory_order_relaxed) == kReady ? s.kernel : nullptr;
+            }
             ring_[h & (kRing - 1u)] = i;
             queued_.fetch_add(1u, std::memory_order_relaxed);
             head_.store(h + 1u, std::memory_order_release);
@@ -288,6 +297,7 @@ private:
     std::atomic<size_t> bytes_{0};
     std::vector<std::shared_ptr<const SplitFft>> ffts_;   // builder thread
     std::atomic<bool> running_{false};
+    bool background_ = true;
     std::thread worker_;
 };
 

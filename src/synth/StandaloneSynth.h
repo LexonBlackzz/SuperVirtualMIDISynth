@@ -18,7 +18,7 @@
 #include "synth/ThreadAffinity.h"
 #include "render/PostFilter.h"
 #include "render/RenderScalar.h"
-#include "render/ReleaseKernels.h"
+#include "render/ReleaseBus.h"
 #include "synth/SoundFont.h"
 #include "synth/Oversample.h"
 #include "synth/VoiceManager.h"
@@ -62,6 +62,10 @@ struct StandaloneSynthConfig {
     // content above ~0.4 of the engine Nyquist is lost, and the output lags by
     // 32 frames.  Env SVMS_UNIFORM_HALF_RATE=1 sets it for offline tools.
     bool uniformHalfRate = false;
+    // Experimental release bus (ReleaseBus.h): eligible short notes ring out as convolutions instead of voices.
+    // Offline only for now. Env SVMS_RELEASE_BUS=1 sets it for offline tools.
+    bool releaseBus = false;
+    uint32_t releaseBusMb = 512;   // kernel memory budget
     float masterVolume = 1.0f;
     bool limiterEnabled = true;
     LimiterAlgorithm limiterAlgorithm = LimiterAlgorithm::Classic;
@@ -283,6 +287,11 @@ public:
             renderer_.SetReExciteMode(false);
         }
         UpdateNoteMergeHoist();
+        busOn_ = (config.releaseBus || std::getenv("SVMS_RELEASE_BUS") != nullptr) &&
+                 !uniformHalf_ && !gpuEnabled_ && oversample_ <= 1u;
+        busBudget_ = size_t(config.releaseBusMb) << 20;
+        busBlock_ = config.maxBlockFrames;
+        if (busOn_) StartBus();
         return true;
     }
 
@@ -299,13 +308,18 @@ public:
             error = "the GPU backend cannot change SoundFonts";
             return false;
         }
-        if (!LoadBanks(paths, error, filters)) return false;
+        if (busOn_) busKernels_.Stop();   // its kernels name the old stack's regions
+        if (!LoadBanks(paths, error, filters)) {
+            if (busOn_) StartBus();
+            return false;
+        }
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             voices_.SilenceChannelImmediate(channel);
         RebuildPrepared();
         UpdateNoteMergeHoist();
         for (uint8_t channel = 0; channel < kChannelCount; ++channel)
             RefreshPreset(channel);
+        if (busOn_) StartBus();
         return true;
     }
 
@@ -362,11 +376,19 @@ public:
         left = cp.mixScaleLeft;
         right = cp.mixScaleRight;
     }
+    bool ReleaseBusOn() const { return busOn_; }
+    uint64_t ReleaseBusNotes() const { return busNotes_; }
+    size_t ReleaseBusHistories() const { return bus_.Histories(); }
+    size_t ReleaseBusKernelBytes() const { return busKernels_.Bytes(); }
 
     ~StandaloneSynth() {
 #if defined(SVMS_GPU_STAGE)
         renderer_.SetGpuStage(nullptr);
 #endif
+        if (busOn_)
+            std::fprintf(stderr, "[SVMS] release bus: %llu of %llu notes, %.1f MB of kernels, %u regions refused\n",
+                         (unsigned long long)busNotes_, (unsigned long long)noteCalls_,
+                         busKernels_.Bytes() / 1e6, busKernels_.Refused());
         // Opt-in end-of-session diagnostic: every plan refusal is a skipped
         // stretch (silence), so a real file should report zero.
         if (std::getenv("SVMS_REPORT_REFUSALS") != nullptr) {
@@ -434,6 +456,7 @@ public:
     StandaloneSynth& operator=(const StandaloneSynth&) = delete;
 
     void Dispatch(uint32_t message, uint64_t frame) {
+        busFrame_ = frame;
         voices_.SetCurrentFrame(EngineFrame(frame));
         if (IsInternalEngineMessage(message)) {
             DispatchInternal(message, frame);
@@ -504,6 +527,7 @@ public:
                                   sampleFrames_, left, right,
                                   frameCount, cfg_, nullptr, 0, true,
                                   absoluteFrame);
+            if (busOn_) bus_.Render(left, right, frameCount, absoluteFrame);
             if (!rawMix_) PostProcess(left, right, frameCount);
         }
     }
@@ -540,6 +564,7 @@ public:
                                           void* userData) {
         StandaloneSynth* self = static_cast<StandaloneSynth*>(userData);
         if (!self) return;
+        self->busFrame_ = self->dispatchAbsoluteFrame_ + blockCursor;
         switch (event.type) {
         case RenderEventType::NoteOn: {
             // Same-key coalescing in the audio-frame domain — the offline
@@ -585,10 +610,14 @@ public:
                 velocity = static_cast<uint8_t>(
                     velocity + boost > 127u ? 127u : velocity + boost);
             }
+            if (self->busOn_ && self->BusNoteOn(event.channel, event.data1, velocity, event.count)) break;
             self->NoteOn(event.channel, event.data1, velocity, event.count);
             break;
         }
         case RenderEventType::NoteOff:
+            if (self->busOn_ && self->BusNoteOff(event.channel, event.data1)) break;
+            self->NoteOff(event.channel, event.data1);
+            break;
         case RenderEventType::StaleNoteOffBatch:
             self->NoteOff(event.channel, event.data1);
             break;
@@ -633,6 +662,7 @@ public:
             mergedNoteOns_ += folded;
             events = mergeScratch_.data();
         }
+        if (busOn_) BusPlan(events, eventCount, absoluteFrame);
 #if defined(_MSC_VER)
         const uint64_t renderBegin = __rdtsc();
 #endif
@@ -644,6 +674,10 @@ public:
 #if defined(_MSC_VER)
         renderCycles_ += __rdtsc() - renderBegin;
 #endif
+        if (busOn_) {
+            busPlan_.clear();
+            bus_.Render(left, right, frameCount, absoluteFrame);
+        }
         if (!rawMix_) PostProcess(left, right, frameCount);
     }
 
@@ -817,6 +851,13 @@ public:
             bendRatio_[channel] = 1.0f;
             RefreshPreset(channel);
         }
+        if (busOn_) {
+            busFrame_ = absoluteFrame;
+            bus_.Reset(absoluteFrame);
+            std::fill(keyHeld_.begin(), keyHeld_.end(), 0u);
+            std::fill(busOff_.begin(), busOff_.end(), UINT64_MAX);
+            for (uint8_t channel = 0; channel < kChannelCount; ++channel) BusMix(channel);
+        }
     }
 
     // Live parameter changes. Audio-thread only (call between blocks): the
@@ -826,8 +867,10 @@ public:
         master_ = volume;
         channels_.SetMasterVolume(master_ * sysexMasterVolume_);
         channels_.RebuildCache(cfg_, static_cast<float>(engineRate_));
-        for (uint8_t channel = 0; channel < kChannelCount; ++channel)
+        for (uint8_t channel = 0; channel < kChannelCount; ++channel) {
             voices_.MarkChannelMixStale(channel, channels_.GetParams()[channel]);
+            BusMix(channel);
+        }
     }
 
     void ConfigureLimiter(bool enabled, LimiterAlgorithm algorithm,
@@ -1208,6 +1251,117 @@ private:
         }
     }
 
+    // ---- release bus (ReleaseBus.h) ------------------------------------------------------------------------
+    // A note goes to the bus instead of a voice when the bus can reproduce it exactly: its note-off is in the same
+    // render call and the same bus block, nothing else is held on its key, nothing but volume, expression and pan
+    // touches its channel in between, the channel is unbent with no vibrato and no pedal, and every region it
+    // plays has a kernel. Everything else is a voice, as before.
+
+    void StartBus() {
+        bus_.Configure(busBlock_);
+        keyHeld_.assign(size_t(kChannelCount) * kNoteCount, 0u);
+        busOff_.assign(size_t(kChannelCount) * kNoteCount, UINT64_MAX);
+        busPend_.assign(size_t(kChannelCount) * kNoteCount, BusPend{});
+        busKernels_.Start([this](uint64_t key, bus::KernelSource& source) {
+            return ReleaseKernelSource(uint32_t(key >> 40), uint32_t(key >> 8), uint8_t(key), source);
+        }, 4u * busBlock_, int(busBlock_), busBudget_, 3, /*background=*/false);
+        for (uint8_t channel = 0; channel < kChannelCount; ++channel) BusMix(channel);
+    }
+
+    void BusMix(uint8_t channel) {
+        if (!busOn_) return;
+        const ChannelParamsSnapshot& cp = channels_.GetParams()[channel];
+        bus_.SetMix(channel, busFrame_, cp.mixScaleLeft, cp.mixScaleRight);
+    }
+
+    // Pairs each note-on of the call with its note-off when nothing on the channel can change the note between.
+    void BusPlan(const RenderEvent* events, uint32_t count, uint64_t absoluteFrame) {
+        busPlan_.clear();
+        ++busCall_;
+        for (uint32_t i = 0; i < count; ++i) {
+            const RenderEvent& e = events[i];
+            const uint8_t c = e.channel & 15u;
+            const uint64_t f = absoluteFrame + e.frameOffset;
+            switch (e.type) {
+            case RenderEventType::NoteOn:
+                if (e.data1 >= kNoteCount) break;
+                busPend_[c * kNoteCount + e.data1] =
+                    e.count > 1u ? BusPend{} : BusPend{f, busCall_, busEpoch_[c]};
+                break;
+            case RenderEventType::NoteOff: {
+                if (e.data1 >= kNoteCount) break;
+                BusPend& p = busPend_[c * kNoteCount + e.data1];
+                if (p.call == busCall_ && p.epoch == busEpoch_[c] && f < bus_.BlockEnd(p.on))
+                    busPlan_.push_back({uint32_t(c * kNoteCount + e.data1), p.on, f});
+                p = BusPend{};
+                break;
+            }
+            case RenderEventType::ControlChange:
+                if (e.data1 != 7u && e.data1 != 10u && e.data1 != 11u) ++busEpoch_[c];
+                break;
+            default:
+                ++busEpoch_[c];
+                break;
+            }
+        }
+        std::sort(busPlan_.begin(), busPlan_.end());
+    }
+
+    bool BusNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t count) {
+        if (count > 1u || note >= kNoteCount || channel >= kChannelCount) return false;
+        const uint64_t on = busFrame_;
+        const uint32_t key = uint32_t(channel) * kNoteCount + note;
+        if (keyHeld_[key] != 0u || !bus_.Open(on)) return false;
+        const auto it = std::lower_bound(busPlan_.begin(), busPlan_.end(), BusPair{key, on, 0u});
+        if (it == busPlan_.end() || it->key != key || it->on != on) return false;
+        const uint64_t off = it->off;
+        const float v = velGain_[velocity & 127u];
+        if (v <= 0.0f || bendRatio_[channel] != 1.0f || tuningEdo_ != 12u || voices_.v.rot != nullptr ||
+            !noteMergeHoist_ || reExcite_ || channels_.IsSustainActive(channel) ||
+            channels_.GetParams()[channel].modDepth != 0.0f)
+            return false;
+        const uint32_t preset = channels_.GetSelectedPreset(channel);
+        const uint32_t font = selFont_[channel];
+        if (font >= banks_.size() || preset >= banks_[font].data->presetCount) return false;
+        const Bank& bank = banks_[font];
+        const SFSampleRegion* regions[8];
+        const uint32_t n = ResolveRegions(font, preset, note, velocity, regions, 8);
+        if (n == 0u || n > 8u) return false;
+        const bus::ReleaseKernel* kernels[8];
+        uint64_t keys[8];
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t local = uint32_t(regions[i] - bank.data->regions);
+            const uint32_t index = bank.regionBase + local;
+            if (index >= prepared_.size() || !prepared_[index].valid) return false;
+            // A retire floor raised above the default shortens a voice's release to where it would reach the
+            // floor (FloorLimitedReleaseSamples). That saves voice time; a bus tail costs nothing more to keep, so
+            // the bus lets it ring to its natural end, as at the default floor. The difference is under the floor.
+            keys[i] = bus::KernelKey(font, local, note);
+            kernels[i] = busKernels_.Get(keys[i]);
+            if (!kernels[i] || off - on >= kernels[i]->heldFrames) return false;
+        }
+        for (uint32_t i = 0; i < n; ++i)
+            bus_.AddNote(keys[i], kernels[i], channel, on, uint32_t(off - on), v);
+        channels_.NoteOn(channel, note, velocity);
+        ++noteCalls_;
+        ++notes_;
+        ++busNotes_;
+        keyHeld_[key] = 1u;
+        busOff_[key] = off;
+        return true;
+    }
+
+    // The note-off of a bus note: its release is already in the bus.
+    bool BusNoteOff(uint8_t channel, uint8_t note) {
+        if (note >= kNoteCount || channel >= kChannelCount) return false;
+        const uint32_t key = uint32_t(channel) * kNoteCount + note;
+        if (busOff_[key] != busFrame_) return false;
+        busOff_[key] = UINT64_MAX;
+        keyHeld_[key] = 0u;
+        channels_.NoteOff(channel, note);
+        return true;
+    }
+
     void UpdateNoteMergeHoist() {
         noteMergeHoist_ = true;
         for (const Bank& b : banks_)
@@ -1245,6 +1399,8 @@ private:
         lastNoteLaunched_ = false;
         ++noteCalls_;
         if (note >= kNoteCount) return;
+        if (!keyHeld_.empty() && channel < kChannelCount)
+            keyHeld_[channel * kNoteCount + note] += multiplicity;
         if (velGain_[velocity & 127u] <= 0.0f) return;  // velocity ignore gate
         channels_.NoteOn(channel, note, velocity);
         uint32_t preset = channels_.GetSelectedPreset(channel);
@@ -1406,6 +1562,9 @@ private:
 #endif
         const bool sustain = channels_.IsSustainActive(channel);
         channels_.NoteOff(channel, note);
+        if (!keyHeld_.empty() && note < kNoteCount && channel < kChannelCount &&
+            keyHeld_[channel * kNoteCount + note] != 0u)
+            --keyHeld_[channel * kNoteCount + note];
         if (rejectPairing_ && note < kNoteCount && channel < kChannelCount) {
             std::deque<uint8_t>& outcomes = keyOutcome_[channel * kNoteCount + note];
             if (!outcomes.empty()) {
@@ -1434,6 +1593,11 @@ private:
         if (controller == 64 && value < 64) ReleaseSustain(channel);
         if (controller == 120) voices_.SilenceChannelImmediate(channel);
         else if (controller == 123) voices_.ReleaseChannel(channel, 0);
+        if (busOn_ && (controller == 120 || controller == 123)) {
+            // Every held voice on the channel is gone or released; bus tails stop with all sound off.
+            std::fill(keyHeld_.begin() + channel * kNoteCount, keyHeld_.begin() + (channel + 1) * kNoteCount, 0u);
+            if (controller == 120) bus_.Cut(channel, busFrame_);
+        }
         else if (controller == 121 && sustain) ReleaseSustain(channel);
         if (controller == 121) Bend(channel, 0, 64);
         else if (controller == 6 || controller == 38 ||
@@ -1455,6 +1619,7 @@ private:
 #endif
                 voices_.MarkChannelMixStale(
                     channel, channels_.GetParams()[channel]);
+                BusMix(channel);
 #if defined(_MSC_VER)
                 dispatchProfile.controlMix += __rdtsc() - mixBegin;
 #endif
@@ -1537,9 +1702,11 @@ private:
                 16383.0f;
             channels_.SetMasterVolume(master_ * sysexMasterVolume_);
             channels_.RebuildCache(cfg_, static_cast<float>(engineRate_));
-            for (uint8_t channel = 0; channel < kChannelCount; ++channel)
+            for (uint8_t channel = 0; channel < kChannelCount; ++channel) {
                 voices_.MarkChannelMixStale(
                     channel, channels_.GetParams()[channel]);
+                BusMix(channel);
+            }
             return;
         }
         if ((message & 0xffffc000u) == kInternalMasterFineTuneTag) {
@@ -1613,6 +1780,26 @@ private:
     uint32_t rotationMode_ = 0;
     std::vector<int16_t> sampleData_;
     std::vector<int16_t> hilbertData_;
+    // Release bus state (see StartBus). keyHeld_ counts note-ons not yet matched by a note-off per channel and
+    // key; busOff_ is a bus note's note-off frame; busPlan_ the current call's note pairs.
+    bool busOn_ = false;
+    size_t busBudget_ = 0;
+    uint32_t busBlock_ = 0;
+    uint64_t busFrame_ = 0;   // output frame of the event being applied
+    uint64_t busNotes_ = 0;
+    uint32_t busCall_ = 0;
+    uint32_t busEpoch_[kChannelCount]{};
+    struct BusPend { uint64_t on = 0; uint32_t call = 0, epoch = 0; };
+    struct BusPair {
+        uint32_t key; uint64_t on, off;
+        bool operator<(const BusPair& o) const { return key != o.key ? key < o.key : on < o.on; }
+    };
+    std::vector<BusPend> busPend_;
+    std::vector<BusPair> busPlan_;
+    std::vector<uint32_t> keyHeld_;
+    std::vector<uint64_t> busOff_;
+    bus::ReleaseKernelStore busKernels_;
+    bus::ReleaseBus bus_;
     uint32_t sampleFrames_ = 0;
     std::vector<PreparedRegion> prepared_;
     VoiceManager voices_;

@@ -6,6 +6,7 @@
 // release decay from the note-off on, times the velocity gain. The prototype held the bus to 60 dB.
 
 #include "synth/StandaloneSynth.h"
+#include "render/RealtimeBlock.h"
 
 #include <cmath>
 #include <cstdio>
@@ -215,6 +216,97 @@ void RunBackend(const std::wstring& sf2, RenderBackend backend, const char* name
     Check(tight.Get(k67) == nullptr && tight.Refused() == 1 && tight.Bytes() == 0, "past the budget a kernel is refused");
 }
 
+// The bus on against the bus off, with a pool large enough that nothing is stolen: the same song must come out.
+// Dense short notes (most go to the bus), long notes and same-key overlaps (voices), volume / expression / pan
+// automation, a bent channel, a sustain pedal and an all-sound-off.
+// features: 1 mix automation, 2 bend, 4 sustain pedal, 8 all sound off.
+void RunBus(const std::wstring& sf2, int features, const char* name) {
+    const uint32_t block = 1024, seconds = 6, frames = seconds * 48000;
+    std::vector<RealtimeEvent> song;
+    uint64_t seq = 0;
+    auto add = [&](uint64_t f, uint32_t msg) { song.push_back({f, seq++, msg, false}); };
+    uint32_t lcg = 777u;
+    auto rnd = [&](uint32_t n) { lcg = lcg * 1664525u + 1013904223u; return (lcg >> 8) % n; };
+    for (uint32_t c = 0; c < 8; ++c) {
+        add(0, 0xB0u | c | (7u << 8) | ((60u + rnd(60)) << 16));
+        add(0, 0xB0u | c | (10u << 8) | (rnd(128) << 16));
+    }
+    for (uint32_t i = 0; i < 12000; ++i) {
+        const uint32_t c = rnd(8), key = 40 + rnd(50), vel = 1 + rnd(127), u = rnd(100);
+        const uint64_t on = 2000 + rnd(frames - 30000);
+        const uint32_t len = u < 15 ? 0u : u < 60 ? rnd(240) : u < 85 ? 240 + rnd(800) : 2400 + rnd(19000);
+        add(on, 0x90u | c | (key << 8) | (vel << 16));
+        add(on + len, 0x80u | c | (key << 8));
+    }
+    if (features & 1)
+    for (uint64_t f = 4000; f < frames - 2000; f += 400 + rnd(2000)) {   // mix automation on channels 0-3
+        const uint32_t c = rnd(4), cc = rnd(3) == 0 ? 10u : rnd(2) ? 7u : 11u;
+        add(f, 0xB0u | c | (cc << 8) | (rnd(128) << 16));
+    }
+    if (features & 2) {
+    // Channel 5 is bent from the start, then centred: its notes are voices until then. (A channel that bends
+    // while bus tails ring leaves them at their pitch, owner decision A, so that is not tested for equality.)
+    add(0, 0xE0u | 5u | (0u << 8) | (80u << 16));
+    add(96000, 0xE0u | 5u | (0u << 8) | (64u << 16));
+    }
+    if (features & 4) {
+    add(120000, 0xB0u | 6u | (64u << 8) | (127u << 16));                  // channel 6 pedal down, then up
+    add(170000, 0xB0u | 6u | (64u << 8) | (0u << 16));
+    }
+    if (features & 8) {
+    add(200000, 0xB0u | 7u | (120u << 8));                                // channel 7 all sound off
+    }
+    std::stable_sort(song.begin(), song.end(), [](const RealtimeEvent& a, const RealtimeEvent& b) {
+        return a.targetFrame != b.targetFrame ? a.targetFrame < b.targetFrame : a.sequence < b.sequence;
+    });
+
+    auto render = [&](bool busOn, std::vector<float>& l, std::vector<float>& r, StandaloneSynth*& keep) {
+        StandaloneSynthConfig cfg;
+        cfg.soundfont = sf2;
+        cfg.sampleRate = 48000;
+        cfg.maxVoices = 65536;
+        cfg.renderThreads = 1;
+        cfg.maxBlockFrames = block;
+        cfg.limiterEnabled = false;
+        cfg.backend = RenderBackend::Scalar;
+        cfg.releaseBus = busOn;
+        keep = new StandaloneSynth();
+        std::string error;
+        if (!keep->Initialize(cfg, error)) { std::printf("FAIL  bus init: %s\n", error.c_str()); ++g_failures; return; }
+        keep->SetRawMix(true);
+        RealtimeBlockRenderer blocks;
+        l.assign(frames, 0.0f);
+        r.assign(frames, 0.0f);
+        size_t next = 0;
+        for (uint32_t f = 0; f < frames; f += block) {
+            const uint32_t n = (std::min)(block, frames - f);
+            size_t end = next;
+            while (end < song.size() && song[end].targetFrame < f + n) ++end;
+            blocks.Render(*keep, song.data() + next, end - next, l.data() + f, r.data() + f, n, f);
+            next = end;
+        }
+    };
+    std::vector<float> offL, offR, onL, onR;
+    StandaloneSynth* off = nullptr;
+    StandaloneSynth* on = nullptr;
+    render(false, offL, offR, off);
+    render(true, onL, onR, on);
+    if (off && on) {
+        char what[200];
+        std::snprintf(what, sizeof what, "the bus is on and takes notes (%llu of 12000, %zu histories at the end, %.1f MB of kernels)",
+                      (unsigned long long)on->ReleaseBusNotes(), on->ReleaseBusHistories(), on->ReleaseBusKernelBytes() / 1e6);
+        Check(on->ReleaseBusOn() && !off->ReleaseBusOn() && on->ReleaseBusNotes() > 3000, what);
+        Check(off->Steals() == 0 && on->Steals() == 0, "nothing is stolen in either render");
+        const double sL = SnrDb(offL, onL), sR = SnrDb(offR, onR);
+        size_t first = 0;
+        while (first < offL.size() && std::fabs(offL[first] - onL[first]) < 1e-5f) ++first;
+        std::snprintf(what, sizeof what, "%s: bus on equals bus off (%.1f / %.1f dB, first difference at frame %zu)", name, sL, sR, first);
+        Check(sL >= 60.0 && sR >= 60.0, what);
+    }
+    delete off;
+    delete on;
+}
+
 }  // namespace
 
 int main() {
@@ -236,6 +328,12 @@ int main() {
 
     RunBackend(sf2, RenderBackend::Scalar, "scalar");
     RunBackend(sf2, RenderBackend::AVX2, "avx2");
+    RunBus(sf2, 0, "plain");
+    RunBus(sf2, 1, "mix automation");
+    RunBus(sf2, 2, "pitch bend");
+    RunBus(sf2, 4, "sustain pedal");
+    RunBus(sf2, 8, "all sound off");
+    RunBus(sf2, 15, "everything");
     std::remove(path.c_str());
     std::printf(g_failures ? "%d FAILED\n" : "all passed\n", g_failures);
     return g_failures ? 1 : 0;
