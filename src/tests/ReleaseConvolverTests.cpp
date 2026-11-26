@@ -125,7 +125,7 @@ bool BankMatchesDirect() {
         if (b == join) id[2] = bank.Add(k[2]);
         for (int i = 0; i < 3; ++i)
             if (id[i] >= 0) std::memcpy(bank.InputBlock(id[i]), &x[i][static_cast<size_t>(b * block)], sizeof(float) * block);
-        bank.Process(&got[static_cast<size_t>(b * block)], &got[static_cast<size_t>(frames + b * block)]);
+        bank.Process(&got[static_cast<size_t>(b * block)], &got[static_cast<size_t>(frames + b * block)], static_cast<uint64_t>(b));
     }
     double peak = 0.0, err = 0.0;
     for (int side = 0; side < 2; ++side)
@@ -141,6 +141,48 @@ bool BankMatchesDirect() {
     const double e = err / (std::max)(peak, 1e-30);
     const bool ok = e < 2e-6;
     std::printf("%s bank of three: error %.2e of peak\n", ok ? "PASS" : "FAIL", e);
+    return ok;
+}
+
+// Late impulses: a kernel without level 0 (the bus's), impulses added blocks after their frame, each at a random
+// block up to its deadline (Insertable), equal direct convolution with the kernel's first 8 blocks zeroed.
+bool LateImpulses() {
+    const int block = 64, blocks = 300, frames = block * blocks, length = 64 * 45 + 17;
+    Kernel kern = RandomKernel(length, 60);
+    ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, 3);
+    k.levels[0].parts = 0;
+    k.levels[0].h.clear();
+    for (int t = 0; t < 8 * block; ++t) kern.l[static_cast<size_t>(t)] = kern.r[static_cast<size_t>(t)] = 0.0f;
+    svms::bus::ConvBank bank;
+    bank.Prepare(block, 3);
+    const int id = bank.Add(k);
+    std::mt19937 rng(61);
+    std::uniform_int_distribution<int> when(0, frames - 1);
+    std::uniform_real_distribution<float> weight(-1.0f, 1.0f);
+    struct Imp { int frame, at; float w; };
+    std::vector<Imp> imps;
+    std::vector<float> x(static_cast<size_t>(frames), 0.0f);
+    for (int i = 0; i < 400; ++i) {
+        const int f = when(rng);
+        int last = f / block;   // the last block before which it can still go in
+        while (last + 1 < blocks && bank.Insertable(static_cast<uint64_t>(f), static_cast<uint64_t>(last + 1), false)) ++last;
+        std::uniform_int_distribution<int> at(f / block, last);
+        imps.push_back({f, at(rng), weight(rng)});
+        x[static_cast<size_t>(f)] += imps.back().w;
+    }
+    std::vector<float> got(static_cast<size_t>(2 * frames), 0.0f);
+    int late = 0;
+    for (int b = 0; b < blocks; ++b) {
+        for (const Imp& m : imps)
+            if (m.at == b) {
+                bank.AddImpulse(id, static_cast<uint64_t>(m.frame), m.w, static_cast<uint64_t>(b));
+                late += m.frame / block < b;
+            }
+        bank.Process(&got[static_cast<size_t>(b * block)], &got[static_cast<size_t>(frames + b * block)], static_cast<uint64_t>(b));
+    }
+    const double e = DirectError(kern, x, got);
+    const bool ok = e < 2e-6 && late > 100;
+    std::printf("%s late impulses: %d of 400 added after their block, error %.2e of peak\n", ok ? "PASS" : "FAIL", late, e);
     return ok;
 }
 
@@ -160,7 +202,7 @@ bool AvxMatchesScalar() {
         out[pass].assign(static_cast<size_t>(2 * frames), 0.0f);
         for (int b = 0; b < blocks; ++b) {
             std::memcpy(bank.InputBlock(id), &x[static_cast<size_t>(b * block)], sizeof(float) * block);
-            bank.Process(&out[pass][static_cast<size_t>(b * block)], &out[pass][static_cast<size_t>(frames + b * block)]);
+            bank.Process(&out[pass][static_cast<size_t>(b * block)], &out[pass][static_cast<size_t>(frames + b * block)], static_cast<uint64_t>(b));
         }
     }
     svms::bus::busScalarOnly = false;
@@ -231,7 +273,7 @@ void BenchBank(int kernels, int levels) {
             const int at = when(rng);
             if (at < block) bank.InputBlock(id[static_cast<size_t>(i)])[at] = 0.5f;
         }
-        bank.Process(l.data(), r.data());
+        bank.Process(l.data(), r.data(), static_cast<uint64_t>(b));
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("bank bench: %d inputs, %.0f ms per second of audio\n", inputs, 1000.0 * s / (double(blocks) * block / 48000.0));
@@ -251,6 +293,7 @@ int main(int argc, char** argv) {
     ok &= MatchesDirect(64, 64 * 45 + 17, 1, 120, 6, "one uniform level");
     ok &= ZeroLatency();
     ok &= BankMatchesDirect();
+    ok &= LateImpulses();
     ok &= AvxMatchesScalar();
     ok &= EvenWork();
     std::printf(ok ? "all release convolver tests passed\n" : "release convolver tests FAILED\n");

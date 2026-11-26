@@ -464,8 +464,10 @@ private:
 // forward FFT and products are skipped. Kernels must share the block size and the level layout of MakeKernel
 // (1, 4, 16, ... blocks).
 //
-// Offline form: a level's work runs whole at the block where its input chunk completes, so a block carries the
-// whole FFT of every level that ends there. (ConvHistory spreads it; the live bus will need that.)
+// Offline form: a level's work runs whole at the block its output chunk starts, so a block carries the whole FFT
+// of every level that starts there. (ConvHistory spreads it; the live bus will need that.) Running just in time
+// leaves room for late impulses: one at a past frame can join until its chunk is transformed (Insertable).
+// A kernel level with no partitions (the bus kernels' level 0) costs nothing.
 class ConvBank {
 public:
     void Prepare(int block, int maxLevels = 3) {
@@ -485,7 +487,6 @@ public:
         while (ring_ < 4 * levels_.back().m * block) ring_ <<= 1;   // a level reads its last whole chunk
         inputs_.clear();
         free_.clear();
-        blockIndex_ = 0;
         used_ = 0;
     }
 
@@ -535,9 +536,31 @@ public:
     float* InputBlock(int id) { return inputs_[static_cast<size_t>(id)].block.data(); }
     int Inputs() const noexcept { return used_; }
 
-    // Adds this block's output (block frames per side) to outL/outR. Returns false if it added nothing.
-    bool Process(float* outL, float* outR) {
-        const uint64_t b = blockIndex_++;
+    // Whether an impulse at `frame` can still go in when block `next` is the next to process: every level that
+    // uses it must not have transformed its chunk yet. Level 1 and up transform chunk j at block (j + 2) * m;
+    // level 0 (if the kernels have one) needs the frame in the open block.
+    bool Insertable(uint64_t frame, uint64_t next, bool level0) const noexcept {
+        const uint64_t blockOf = frame / static_cast<uint64_t>(block_);
+        if (level0 && blockOf < next) return false;
+        for (size_t lv = 1; lv < levels_.size(); ++lv) {
+            const uint64_t m = static_cast<uint64_t>(levels_[lv].m);
+            if ((blockOf / m + 2u) * m < next) return false;
+        }
+        return true;
+    }
+
+    // Adds an impulse of weight `w` at `frame` to input `id` (Insertable must hold). `next` is the next block.
+    void AddImpulse(int id, uint64_t frame, float w, uint64_t next) {
+        Input& in = inputs_[static_cast<size_t>(id)];
+        const uint64_t start = next * static_cast<uint64_t>(block_);
+        if (frame >= start) { in.block[static_cast<size_t>(frame - start)] += w; return; }
+        in.ring[static_cast<size_t>(frame & static_cast<uint64_t>(ring_ - 1))] += w;
+        in.loud[static_cast<size_t>((frame / static_cast<uint64_t>(block_)) % static_cast<uint64_t>(ring_ / block_))] = 1u;
+    }
+
+    // Adds block `b`'s output (block frames per side) to outL/outR. Blocks are absolute (frame b * block on) and
+    // consecutive. Returns false if it added nothing.
+    bool Process(float* outL, float* outR, uint64_t b) {
         const uint64_t mask = static_cast<uint64_t>(ring_ - 1);
         const uint64_t blocksInRing = static_cast<uint64_t>(ring_ / block_);
         for (Input& in : inputs_) {
@@ -562,13 +585,13 @@ public:
                 any = Chunk(lv, static_cast<int64_t>(b), 0, mask, blocksInRing, outL, outR, true) || any;
                 continue;
             }
-            if (b % m == 0u) {
-                // Chunk c starts: X_{c-1} is complete, and so is output chunk c + 1.
-                const int64_t c = static_cast<int64_t>(b / m);
-                float* oL = &L.out[static_cast<size_t>((c + 1) & 1) * 2 * static_cast<size_t>(n)];
-                L.outLive[(c + 1) & 1] = Chunk(lv, c - 1, 2, mask, blocksInRing, oL, oL + n, false);
-            }
             const int64_t c = static_cast<int64_t>(b / m);
+            if (b % m == 0u) {
+                // Chunk c starts and needs its output now, from X_{c-2} (complete since chunk c - 1 began). Just in
+                // time rather than a chunk ahead, so an impulse can join chunk j until block (j + 2) * m.
+                float* oL = &L.out[static_cast<size_t>(c & 1) * 2 * static_cast<size_t>(n)];
+                L.outLive[c & 1] = Chunk(lv, c - 2, 2, mask, blocksInRing, oL, oL + n, false);
+            }
             if (L.outLive[c & 1]) {
                 const float* oL = &L.out[static_cast<size_t>(c & 1) * 2 * static_cast<size_t>(n)];
                 const float* oR = oL + n;
@@ -655,7 +678,7 @@ private:
         loudIds_.clear();
         for (size_t id = 0; id < inputs_.size(); ++id) {
             Input& in = inputs_[id];
-            if (!in.used || lv >= in.k->levels.size()) continue;
+            if (!in.used || lv >= in.k->levels.size() || in.k->levels[lv].parts == 0) continue;
             bool loud = false;
             for (int64_t bb = j * L.m; bb < (j + 1) * L.m && !loud; ++bb)
                 if (bb >= 0) loud = in.loud[static_cast<size_t>(static_cast<uint64_t>(bb) % blocksInRing)] != 0;
@@ -695,7 +718,7 @@ private:
         size_t need = 1;
         for (size_t id = 0; id < inputs_.size(); ++id) {
             const Input& in = inputs_[id];
-            if (!in.used || lv >= in.k->levels.size() || !in.xLive[lv]) continue;
+            if (!in.used || lv >= in.k->levels.size() || in.k->levels[lv].parts == 0 || !in.xLive[lv]) continue;
             liveIds_.push_back(static_cast<uint32_t>(id));
             need = (std::max)(need, static_cast<size_t>(in.k->levels[lv].parts));
         }
@@ -739,7 +762,6 @@ private:
     }
 
     int block_ = 0, ring_ = 1, used_ = 0;
-    uint64_t blockIndex_ = 0;
     std::vector<Level> levels_;
     std::vector<Input> inputs_;
     std::vector<int> free_;

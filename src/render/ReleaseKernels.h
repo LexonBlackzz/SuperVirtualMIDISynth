@@ -124,9 +124,10 @@ inline void RenderHeld(const KernelSource& s, uint32_t frames, float* left, floa
 }
 
 struct ReleaseKernel {
-    uint32_t heldFrames = 0;           // A covers tau < heldFrames (the bus window)
-    std::vector<float> heldL, heldR;   // A, for the held-part correction
-    ConvKernel tail;                   // B(tau) = A(tau) * r^tau for tau < heldFrames + releaseFrames
+    uint32_t heldFrames = 0;           // A covers tau < heldFrames (rendered directly by the bus)
+    std::vector<float> heldL, heldR;   // A
+    ConvKernel tail;                   // B(tau) = A(tau) * r^tau for tau < heldFrames + releaseFrames; with heldFrames
+                                       // of 8 blocks or more, level 0 (tau < 8 blocks) is left empty
     float releaseDecay = 0.0f;
     size_t bytes = 0;
 };
@@ -163,6 +164,11 @@ inline std::unique_ptr<ReleaseKernel> BuildKernel(const std::vector<KernelSource
         p *= s.releaseDecay;
     }
     k->tail = MakeKernel(l.data(), r.data(), static_cast<int>(length), block, maxLevels);
+    if (heldFrames >= 8u * static_cast<uint32_t>(block) && !k->tail.levels.empty()) {
+        // The bus renders tau < heldFrames directly from A; level 0 (the first 8 blocks) is not convolved.
+        k->tail.levels[0].parts = 0;
+        std::vector<Cf>().swap(k->tail.levels[0].h);
+    }
     k->releaseDecay = s.releaseDecay;
     k->bytes = 2u * heldFrames * sizeof(float);
     for (const ConvLevel& L : k->tail.levels) k->bytes += L.h.size() * sizeof(Cf);

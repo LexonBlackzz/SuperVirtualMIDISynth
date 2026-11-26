@@ -730,6 +730,48 @@ public:
                                       uint32_t blockOffset,
                                       bool newest = false);
 
+    // Release bus handoff. The layers of the generation the next note-off on
+    // (channel, note) releases, when that generation is one unit (not
+    // merged): their handles in `out`, their play index in `playIndex`.
+    // Returns the layer count, 0 if there is no such generation.
+    uint32_t NextReleasedLayers(uint8_t channel, uint8_t note, bool newest,
+                                VoiceHandle* out, uint32_t max,
+                                uint32_t& playIndex) const {
+        playIndex = newest ? FindNewestPlayIndex(channel, note)
+                           : FindOldestPlayIndex(channel, note);
+        if (playIndex == UINT32_MAX) return 0u;
+        int32_t cursor = newest ? channelKeyVoiceHead_[channel][note]
+                                : channelKeyVoiceOldest_[channel][note];
+        uint32_t n = 0u;
+        while (cursor >= 0) {
+            const VoiceHandle h = static_cast<VoiceHandle>(cursor);
+            cursor = newest ? v.nextChannelKeyVoice[h] : v.prevChannelKeyVoice[h];
+            if (v.state[h] == static_cast<uint8_t>(VoiceState::Free)) continue;
+            if (v.playIndex[h] != playIndex) break;
+            if (GetVoiceMultiplicity(h) != 1u || n == max) return 0u;
+            out[n++] = h;
+        }
+        return n;
+    }
+    // Retires a handed-off voice silently, now, if its slot still holds it
+    // (same play index, channel and key: a stolen voice is left alone).
+    bool RetireHandedOff(VoiceHandle h, uint32_t playIndex, uint8_t channel,
+                         uint8_t note) {
+        if (v.state[h] == static_cast<uint8_t>(VoiceState::Free) ||
+            v.playIndex[h] != playIndex || v.channel[h] != channel ||
+            v.note[h] != note)
+            return false;
+        // As SilenceChannelImmediate: the whole-voice pre-pass first sees
+        // the voice end here.
+        if (silenceVoiceHook_) {
+            EnsureMaterialized(h);
+            silenceVoiceHook_(h, silenceHookUserData_);
+        }
+        v.stealFadeInFramesRemaining[h] = 0;
+        RetireVoice(h);
+        return true;
+    }
+
     void SetVoiceEnvelope(VoiceHandle handle, float initialGain, float sustainLevel,
                           uint32_t delaySamples, uint32_t holdSamples, uint32_t attackSamples,
                           uint32_t decaySamples, float attackGainStep,

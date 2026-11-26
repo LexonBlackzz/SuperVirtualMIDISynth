@@ -295,9 +295,12 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
     render(true, onL, onR, on);
     if (off && on) {
         char what[200];
-        std::snprintf(what, sizeof what, "the bus is on and takes notes (%llu of 12000, %zu histories at the end, %.1f MB of kernels)",
-                      (unsigned long long)on->ReleaseBusNotes(), on->ReleaseBusHistories(), on->ReleaseBusKernelBytes() / 1e6);
-        Check(on->ReleaseBusOn() && !off->ReleaseBusOn() && on->ReleaseBusNotes() > 3000, what);
+        std::snprintf(what, sizeof what, "the bus is on and takes notes (%llu same-block and %llu handed off of 12000, "
+                      "%zu histories at the end, %.1f MB of kernels)",
+                      (unsigned long long)on->ReleaseBusNotes(), (unsigned long long)on->ReleaseBusHanded(),
+                      on->ReleaseBusHistories(), on->ReleaseBusKernelBytes() / 1e6);
+        Check(on->ReleaseBusOn() && !off->ReleaseBusOn() && on->ReleaseBusNotes() > 3000 &&
+              on->ReleaseBusHanded() > 2000, what);
         Check(off->Steals() == 0 && on->Steals() == 0, "nothing is stolen in either render");
         const double sL = SnrDb(offL, onL), sR = SnrDb(offR, onR);
         size_t first = 0;
