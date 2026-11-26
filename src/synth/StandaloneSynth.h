@@ -33,8 +33,10 @@
 #include <cstring>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <thread>
 #include <vector>
 #if defined(_MSC_VER)
@@ -386,9 +388,12 @@ public:
         renderer_.SetGpuStage(nullptr);
 #endif
         if (busOn_)
-            std::fprintf(stderr, "[SVMS] release bus: %llu of %llu notes, %.1f MB of kernels, %u regions refused\n",
+            std::fprintf(stderr, "[SVMS] release bus: %llu of %llu notes, %.1f MB of kernels, %u regions refused, "
+                         "%.0f convolutions per block, %.0f ms per audio second\n",
                          (unsigned long long)busNotes_, (unsigned long long)noteCalls_,
-                         busKernels_.Bytes() / 1e6, busKernels_.Refused());
+                         busKernels_.Bytes() / 1e6, busKernels_.Refused(),
+                         bus_.Blocks() ? double(bus_.Convolved()) / double(bus_.Blocks()) : 0.0,
+                         bus_.Blocks() ? bus_.BusNs() / 1e6 / (double(bus_.Blocks()) * busBlock_ / rate_) : 0.0);
         // Opt-in end-of-session diagnostic: every plan refusal is a skipped
         // stretch (silence), so a real file should report zero.
         if (std::getenv("SVMS_REPORT_REFUSALS") != nullptr) {
@@ -1262,8 +1267,20 @@ private:
         keyHeld_.assign(size_t(kChannelCount) * kNoteCount, 0u);
         busOff_.assign(size_t(kChannelCount) * kNoteCount, UINT64_MAX);
         busPend_.assign(size_t(kChannelCount) * kNoteCount, BusPend{});
-        busKernels_.Start([this](uint64_t key, bus::KernelSource& source) {
-            return ReleaseKernelSource(uint32_t(key >> 40), uint32_t(key >> 8), uint8_t(key), source);
+        busSets_.clear();
+        busSetIds_.clear();
+        busSetOf_.clear();
+        // A kernel key names a font, a region set (busSets_) and a key. Inline mode: built on this thread, so the
+        // set registry needs no lock.
+        busKernels_.Start([this](uint64_t key, std::vector<bus::KernelSource>& sources) {
+            const uint32_t set = uint32_t(key >> 8);
+            if (set >= busSets_.size()) return false;
+            sources.clear();
+            for (uint32_t local : busSets_[set]) {
+                sources.emplace_back();
+                if (!ReleaseKernelSource(uint32_t(key >> 40), local, uint8_t(key), sources.back())) return false;
+            }
+            return true;
         }, 4u * busBlock_, int(busBlock_), busBudget_, 3, /*background=*/false);
         for (uint8_t channel = 0; channel < kChannelCount; ++channel) BusMix(channel);
     }
@@ -1311,7 +1328,7 @@ private:
         if (count > 1u || note >= kNoteCount || channel >= kChannelCount) return false;
         const uint64_t on = busFrame_;
         const uint32_t key = uint32_t(channel) * kNoteCount + note;
-        if (keyHeld_[key] != 0u || !bus_.Open(on)) return false;
+        if (keyHeld_[key] != 0u || !bus_.Open(channel, on)) return false;
         const auto it = std::lower_bound(busPlan_.begin(), busPlan_.end(), BusPair{key, on, 0u});
         if (it == busPlan_.end() || it->key != key || it->on != on) return false;
         const uint64_t off = it->off;
@@ -1327,21 +1344,30 @@ private:
         const SFSampleRegion* regions[8];
         const uint32_t n = ResolveRegions(font, preset, note, velocity, regions, 8);
         if (n == 0u || n > 8u) return false;
-        const bus::ReleaseKernel* kernels[8];
-        uint64_t keys[8];
-        for (uint32_t i = 0; i < n; ++i) {
-            const uint32_t local = uint32_t(regions[i] - bank.data->regions);
-            const uint32_t index = bank.regionBase + local;
-            if (index >= prepared_.size() || !prepared_[index].valid) return false;
-            // A retire floor raised above the default shortens a voice's release to where it would reach the
-            // floor (FloorLimitedReleaseSamples). That saves voice time; a bus tail costs nothing more to keep, so
-            // the bus lets it ring to its natural end, as at the default floor. The difference is under the floor.
-            keys[i] = bus::KernelKey(font, local, note);
-            kernels[i] = busKernels_.Get(keys[i]);
-            if (!kernels[i] || off - on >= kernels[i]->heldFrames) return false;
+        // One kernel for the note's whole region set (a stereo pair is one convolution, not two).
+        const uint64_t tag = (uint64_t(font) << 32) | (uint64_t(preset) << 15) | (uint32_t(note) << 7) | velocity;
+        auto known = busSetOf_.find(tag);
+        if (known == busSetOf_.end()) {
+            std::vector<uint32_t> locals(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                locals[i] = uint32_t(regions[i] - bank.data->regions);
+                const uint32_t index = bank.regionBase + locals[i];
+                if (index >= prepared_.size() || !prepared_[index].valid) return false;
+            }
+            auto id = busSetIds_.find(locals);
+            if (id == busSetIds_.end()) {
+                id = busSetIds_.emplace(locals, uint32_t(busSets_.size())).first;
+                busSets_.push_back(locals);
+            }
+            known = busSetOf_.emplace(tag, id->second).first;
         }
-        for (uint32_t i = 0; i < n; ++i)
-            bus_.AddNote(keys[i], kernels[i], channel, on, uint32_t(off - on), v);
+        // A retire floor raised above the default shortens a voice's release to where it would reach the floor
+        // (FloorLimitedReleaseSamples). That saves voice time; a bus tail costs nothing more to keep, so the bus
+        // lets it ring to its natural end, as at the default floor. The difference is under the floor.
+        const uint64_t kernelKey = bus::KernelKey(font, known->second, note);
+        const bus::ReleaseKernel* kernel = busKernels_.Get(kernelKey);
+        if (!kernel || off - on >= kernel->heldFrames) return false;
+        bus_.AddNote(kernelKey, kernel, channel, on, uint32_t(off - on), v);
         channels_.NoteOn(channel, note, velocity);
         ++noteCalls_;
         ++notes_;
@@ -1798,6 +1824,9 @@ private:
     std::vector<BusPair> busPlan_;
     std::vector<uint32_t> keyHeld_;
     std::vector<uint64_t> busOff_;
+    std::vector<std::vector<uint32_t>> busSets_;           // set id -> its regions (bank-local indices)
+    std::map<std::vector<uint32_t>, uint32_t> busSetIds_;  // regions -> set id
+    std::unordered_map<uint64_t, uint32_t> busSetOf_;      // font, preset, key, velocity -> set id
     bus::ReleaseKernelStore busKernels_;
     bus::ReleaseBus bus_;
     uint32_t sampleFrames_ = 0;

@@ -101,6 +101,48 @@ bool ZeroLatency() {
     return ok;
 }
 
+// A bank of three inputs against three kernels (one, two and three levels; the last input joins late) is the sum
+// of the three direct convolutions.
+bool BankMatchesDirect() {
+    const int block = 64, blocks = 260, frames = block * blocks;
+    const int lengths[3] = {64 * 6, 64 * 30, 64 * 45 + 17};
+    Kernel kern[3];
+    std::vector<ConvKernel> k;
+    std::vector<float> x[3];
+    for (int i = 0; i < 3; ++i) {
+        kern[i] = RandomKernel(lengths[i], 20u + i);
+        k.push_back(MakeKernel(kern[i].l.data(), kern[i].r.data(), lengths[i], block, 3));
+        x[i] = RandomInput(frames, 30u + i);
+    }
+    const int join = 37;   // the third input is silent before block 37 and added there
+    std::fill(x[2].begin(), x[2].begin() + join * block, 0.0f);
+    svms::bus::ConvBank bank;
+    bank.Prepare(block, 3);
+    int id[3] = {bank.Add(k[0]), bank.Add(k[1]), -1};
+    std::vector<float> got(static_cast<size_t>(2 * frames), 0.0f);
+    for (int b = 0; b < blocks; ++b) {
+        if (b == join) id[2] = bank.Add(k[2]);
+        for (int i = 0; i < 3; ++i)
+            if (id[i] >= 0) std::memcpy(bank.InputBlock(id[i]), &x[i][static_cast<size_t>(b * block)], sizeof(float) * block);
+        bank.Process(&got[static_cast<size_t>(b * block)], &got[static_cast<size_t>(frames + b * block)]);
+    }
+    double peak = 0.0, err = 0.0;
+    for (int side = 0; side < 2; ++side)
+        for (int t = 0; t < frames; ++t) {
+            double y = 0.0;
+            for (int i = 0; i < 3; ++i) {
+                const std::vector<float>& h = side ? kern[i].r : kern[i].l;
+                for (int tau = 0; tau < lengths[i] && tau <= t; ++tau) y += double(h[static_cast<size_t>(tau)]) * x[i][static_cast<size_t>(t - tau)];
+            }
+            peak = std::fmax(peak, std::fabs(y));
+            err = std::fmax(err, std::fabs(y - got[static_cast<size_t>(side * frames + t)]));
+        }
+    const double e = err / (std::max)(peak, 1e-30);
+    const bool ok = e < 2e-6;
+    std::printf("%s bank of three: error %.2e of peak\n", ok ? "PASS" : "FAIL", e);
+    return ok;
+}
+
 // The work of the long partitions is spread: no block does much more than the average.
 bool EvenWork() {
     const int block = 1024, length = 240000;
@@ -153,6 +195,7 @@ int main(int argc, char** argv) {
     ok &= MatchesDirect(32, 32 * 150 + 5, 4, 400, 5, "four levels");
     ok &= MatchesDirect(64, 64 * 45 + 17, 1, 120, 6, "one uniform level");
     ok &= ZeroLatency();
+    ok &= BankMatchesDirect();
     ok &= EvenWork();
     std::printf(ok ? "all release convolver tests passed\n" : "release convolver tests FAILED\n");
     return ok ? 0 : 1;

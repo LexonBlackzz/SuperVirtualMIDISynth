@@ -187,8 +187,9 @@ void RunBackend(const std::wstring& sf2, RenderBackend backend, const char* name
     // The store: lazy, deduplicated, within budget.
     const uint32_t held = 4 * 1024;
     bus::ReleaseKernelStore store;
-    store.Start([&](uint64_t k, bus::KernelSource& out) {
-        return synth.ReleaseKernelSource(uint32_t(k >> 40), uint32_t(k >> 8) & 0xFFFFFFFFu, uint8_t(k), out);
+    store.Start([&](uint64_t k, std::vector<bus::KernelSource>& out) {
+        out.resize(1);
+        return synth.ReleaseKernelSource(uint32_t(k >> 40), uint32_t(k >> 8) & 0xFFFFFFFFu, uint8_t(k), out[0]);
     }, held, 1024, size_t(64) << 20);
     const uint64_t k67 = bus::KernelKey(0, 0, key);
     Check(store.Get(k67) == nullptr, "a kernel is not there on first use");
@@ -208,8 +209,9 @@ void RunBackend(const std::wstring& sf2, RenderBackend backend, const char* name
     Check(store.Get(bus::KernelKey(0, 9, key)) == nullptr && store.Refused() == 1, "and is refused once");
 
     bus::ReleaseKernelStore tight;
-    tight.Start([&](uint64_t k, bus::KernelSource& out) {
-        return synth.ReleaseKernelSource(uint32_t(k >> 40), uint32_t(k >> 8) & 0xFFFFFFFFu, uint8_t(k), out);
+    tight.Start([&](uint64_t k, std::vector<bus::KernelSource>& out) {
+        out.resize(1);
+        return synth.ReleaseKernelSource(uint32_t(k >> 40), uint32_t(k >> 8) & 0xFFFFFFFFu, uint8_t(k), out[0]);
     }, held, 1024, size_t(64) << 10);   // this kernel needs about 0.5 MB
     tight.Get(k67);
     tight.WaitIdle();

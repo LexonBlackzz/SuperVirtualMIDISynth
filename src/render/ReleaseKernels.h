@@ -131,11 +131,27 @@ struct ReleaseKernel {
     size_t bytes = 0;
 };
 
-inline std::unique_ptr<ReleaseKernel> BuildKernel(const KernelSource& s, uint32_t heldFrames, int block,
-                                                  int maxLevels = 3) {
+// The regions a note plays at once (a stereo pair, layers) can share one kernel when they release at the same
+// rate: the kernel is the sum of their held outputs. SetRefusal says why a set cannot, or returns nullptr.
+inline const char* SetRefusal(const std::vector<KernelSource>& set) noexcept {
+    if (set.empty()) return "no regions";
+    for (const KernelSource& s : set) {
+        if (const char* why = KernelRefusal(s)) return why;
+        if (s.releaseDecay != set[0].releaseDecay || s.releaseFrames != set[0].releaseFrames)
+            return "regions release at different rates";
+    }
+    return nullptr;
+}
+
+inline std::unique_ptr<ReleaseKernel> BuildKernel(const std::vector<KernelSource>& set, uint32_t heldFrames,
+                                                  int block, int maxLevels = 3) {
+    const KernelSource& s = set[0];
     const uint32_t length = heldFrames + s.releaseFrames;
-    std::vector<float> l(length), r(length);
-    RenderHeld(s, length, l.data(), r.data());
+    std::vector<float> l(length, 0.0f), r(length, 0.0f), one(length), oneR(length);
+    for (const KernelSource& region : set) {
+        RenderHeld(region, length, one.data(), oneR.data());
+        for (uint32_t t = 0; t < length; ++t) { l[t] += one[t]; r[t] += oneR[t]; }
+    }
     std::unique_ptr<ReleaseKernel> k(new ReleaseKernel());
     k->heldFrames = heldFrames;
     k->heldL.assign(l.begin(), l.begin() + heldFrames);
@@ -153,10 +169,16 @@ inline std::unique_ptr<ReleaseKernel> BuildKernel(const KernelSource& s, uint32_
     return k;
 }
 
+inline std::unique_ptr<ReleaseKernel> BuildKernel(const KernelSource& s, uint32_t heldFrames, int block,
+                                                  int maxLevels = 3) {
+    return BuildKernel(std::vector<KernelSource>{s}, heldFrames, block, maxLevels);
+}
+
 class ReleaseKernelStore {
 public:
-    // Fills the source for a key; false if the key names nothing. Called on the store's thread.
-    using SourceFn = std::function<bool(uint64_t key, KernelSource& source)>;
+    // Fills the sources (one per region the kernel sums) for a key; false if the key names nothing. Called on the
+    // store's thread, or the caller's in inline mode.
+    using SourceFn = std::function<bool(uint64_t key, std::vector<KernelSource>& sources)>;
 
     ReleaseKernelStore() = default;
     ReleaseKernelStore(const ReleaseKernelStore&) = delete;
@@ -263,9 +285,9 @@ private:
     }
 
     void Build(Slot& s) {
-        KernelSource src;
+        std::vector<KernelSource> src;
         const uint64_t key = s.key.load(std::memory_order_relaxed) - 1u;
-        if (!source_(key, src) || KernelRefusal(src)) return Refuse(s);
+        if (!source_(key, src) || SetRefusal(src)) return Refuse(s);
         std::unique_ptr<ReleaseKernel> k = BuildKernel(src, heldFrames_, block_, maxLevels_);
         if (bytes_.load(std::memory_order_relaxed) + k->bytes > budget_) return Refuse(s);
         for (ConvLevel& L : k->tail.levels) L.fft = SharedFft(L.fft);   // one twiddle table per size

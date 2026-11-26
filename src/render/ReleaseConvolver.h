@@ -297,5 +297,211 @@ private:
     std::vector<LevelState> state_;
 };
 
+// Many inputs, each against its own kernel, summed into one output (one MIDI channel of the release bus). The sum
+// is linear, so each level adds every input's spectrum products into one accumulator and runs one inverse FFT for
+// all of them. An input whose two chunks under a spectrum are silent has no spectrum: its forward FFT and products
+// are skipped. Kernels must share the block size and the level layout of MakeKernel (1, 4, 16, ... blocks).
+//
+// Offline form: a level's work runs whole at the block where its input chunk completes, so a block carries the
+// whole FFT of every level that ends there. (ConvHistory spreads it; the live bus will need that.)
+class ConvBank {
+public:
+    void Prepare(int block, int maxLevels = 3) {
+        block_ = block;
+        levels_.clear();
+        for (int lv = 0, m = 1; lv < maxLevels; ++lv, m *= 4) {
+            Level L;
+            L.m = m;
+            L.size = 2 * m * block;
+            L.fft = std::make_shared<const SplitFft>(L.size);
+            L.acc.assign(static_cast<size_t>(L.size), Cf(0.0f, 0.0f));
+            L.out.assign(static_cast<size_t>(4 * m * block), 0.0f);
+            levels_.push_back(std::move(L));
+        }
+        ring_ = 1;
+        while (ring_ < 4 * 2 * levels_.back().m * block) ring_ <<= 1;
+        inputs_.clear();
+        free_.clear();
+        blockIndex_ = 0;
+        used_ = 0;
+    }
+
+    // A new input against `k` (which must outlive it); silent before now. Returns its id.
+    int Add(const ConvKernel& k) {
+        int id;
+        if (!free_.empty()) { id = free_.back(); free_.pop_back(); }
+        else { id = static_cast<int>(inputs_.size()); inputs_.emplace_back(); }
+        Input& in = inputs_[static_cast<size_t>(id)];
+        in.k = &k;
+        in.ring.assign(static_cast<size_t>(ring_), 0.0f);
+        in.block.assign(static_cast<size_t>(block_), 0.0f);
+        in.loud.assign(static_cast<size_t>(ring_ / block_), 0u);
+        in.fdl.resize(k.levels.size());
+        in.live.resize(k.levels.size());
+        for (size_t lv = 0; lv < k.levels.size(); ++lv) {
+            const ConvLevel& L = k.levels[lv];
+            in.fdl[lv].assign(static_cast<size_t>(L.parts) * static_cast<size_t>(2 * L.m * block_), Cf(0.0f, 0.0f));
+            in.live[lv].assign(static_cast<size_t>(L.parts), 0u);
+        }
+        in.used = true;
+        ++used_;
+        return id;
+    }
+
+    void Remove(int id) {
+        Input& in = inputs_[static_cast<size_t>(id)];
+        if (!in.used) return;
+        in = Input{};
+        free_.push_back(id);
+        // With no input left, an output chunk computed ahead belongs to removed (or cut) inputs: drop it.
+        if (--used_ == 0)
+            for (Level& L : levels_) L.outLive[0] = L.outLive[1] = false;
+    }
+
+    void RemoveAll() {
+        for (size_t i = 0; i < inputs_.size(); ++i) if (inputs_[i].used) Remove(static_cast<int>(i));
+    }
+
+    // This block's input for `id`, block frames; cleared by Process.
+    float* InputBlock(int id) { return inputs_[static_cast<size_t>(id)].block.data(); }
+    int Inputs() const noexcept { return used_; }
+
+    // Adds this block's output (block frames per side) to outL/outR. Returns false if it added nothing.
+    bool Process(float* outL, float* outR) {
+        const uint64_t b = blockIndex_++;
+        const uint64_t mask = static_cast<uint64_t>(ring_ - 1);
+        const uint64_t blocksInRing = static_cast<uint64_t>(ring_ / block_);
+        for (Input& in : inputs_) {
+            if (!in.used) continue;
+            uint8_t loud = 0;
+            const uint64_t f0 = b * static_cast<uint64_t>(block_);
+            for (int i = 0; i < block_; ++i) {
+                const float x = in.block[static_cast<size_t>(i)];
+                in.ring[static_cast<size_t>((f0 + static_cast<uint64_t>(i)) & mask)] = x;
+                loud |= x != 0.0f;
+            }
+            in.loud[static_cast<size_t>(b % blocksInRing)] = loud;
+            std::fill(in.block.begin(), in.block.end(), 0.0f);
+        }
+        bool any = false;
+        for (size_t lv = 0; lv < levels_.size(); ++lv) {
+            Level& L = levels_[lv];
+            const uint64_t m = static_cast<uint64_t>(L.m);
+            const int n = L.m * block_;
+            if (lv == 0) {
+                // Output chunk b = sum_p X_{b - p} H_p, all in this block.
+                if (Chunk(lv, static_cast<int64_t>(b), static_cast<int64_t>(b), mask, blocksInRing)) {
+                    const float scale = 1.0f / static_cast<float>(L.size);
+                    for (int i = 0; i < n; ++i) {
+                        outL[i] += L.acc[static_cast<size_t>(n + i)].real() * scale;
+                        outR[i] += L.acc[static_cast<size_t>(n + i)].imag() * scale;
+                    }
+                    any = true;
+                }
+                continue;
+            }
+            if (b % m == 0u) {
+                // Chunk c starts: X_{c-1} is complete, and output chunk c + 1 = sum_p X_{c - 1 - p} H_p.
+                const int64_t c = static_cast<int64_t>(b / m);
+                float* oL = &L.out[static_cast<size_t>((c + 1) & 1) * 2 * static_cast<size_t>(n)];
+                float* oR = oL + n;
+                if (Chunk(lv, c - 1, c + 1, mask, blocksInRing)) {
+                    const float scale = 1.0f / static_cast<float>(L.size);
+                    for (int i = 0; i < n; ++i) {
+                        oL[i] = L.acc[static_cast<size_t>(n + i)].real() * scale;
+                        oR[i] = L.acc[static_cast<size_t>(n + i)].imag() * scale;
+                    }
+                    L.outLive[(c + 1) & 1] = true;
+                } else {
+                    L.outLive[(c + 1) & 1] = false;
+                }
+            }
+            const int64_t c = static_cast<int64_t>(b / m);
+            if (L.outLive[c & 1]) {
+                const float* oL = &L.out[static_cast<size_t>(c & 1) * 2 * static_cast<size_t>(n)];
+                const float* oR = oL + n;
+                const int off = static_cast<int>(b % m) * block_;
+                for (int i = 0; i < block_; ++i) { outL[i] += oL[off + i]; outR[i] += oR[off + i]; }
+                any = true;
+            }
+        }
+        return any;
+    }
+
+private:
+    struct Input {
+        const ConvKernel* k = nullptr;
+        std::vector<float> ring, block;
+        std::vector<uint8_t> loud;               // per block in the ring: any non-zero input
+        std::vector<std::vector<Cf>> fdl;        // per level: parts x 2N spectra
+        std::vector<std::vector<uint8_t>> live;  // per level and part slot: the spectrum is non-zero
+        bool used = false;
+    };
+    struct Level {
+        int m = 1, size = 0;
+        std::shared_ptr<const SplitFft> fft;
+        std::vector<Cf> acc;
+        std::vector<float> out;   // [parity][side][N], levels >= 1
+        bool outLive[2] = {false, false};
+    };
+
+    // Transforms every input's X_j (input chunks j - 1 and j) and sums X_{t - lag - p} H_p into the level's
+    // accumulator, then inverts it. False if nothing contributed (the accumulator is not touched then).
+    bool Chunk(size_t lv, int64_t j, int64_t t, uint64_t mask, uint64_t blocksInRing) {
+        Level& L = levels_[lv];
+        const int n = L.m * block_, size = L.size;
+        const int64_t lag = t - j;
+        bool any = false;
+        for (Input& in : inputs_) {
+            if (!in.used || lv >= in.k->levels.size()) continue;
+            const ConvLevel& K = in.k->levels[lv];
+            const int64_t parts = K.parts;
+            // X_j: input frames [(j - 1) N, (j + 1) N), silent unless one of its blocks had input.
+            const int64_t slot = ((j % parts) + parts) % parts;
+            bool loud = false;
+            for (int64_t bb = (j - 1) * L.m; bb < (j + 1) * L.m && !loud; ++bb)
+                if (bb >= 0) loud = in.loud[static_cast<size_t>(static_cast<uint64_t>(bb) % blocksInRing)] != 0;
+            Cf* x = &in.fdl[lv][static_cast<size_t>(slot) * static_cast<size_t>(size)];
+            in.live[lv][static_cast<size_t>(slot)] = loud;
+            if (loud) {
+                const int64_t first = (j - 1) * n;
+                for (int i = 0; i < size; ++i) {
+                    const int64_t f = first + i;
+                    x[i] = Cf(f < 0 ? 0.0f : in.ring[static_cast<size_t>(static_cast<uint64_t>(f) & mask)], 0.0f);
+                }
+                L.fft->Run(x, false);
+            }
+            for (int64_t p = 0; p < parts; ++p) {
+                const int64_t sj = (((t - lag - p) % parts) + parts) % parts;
+                if (!in.live[lv][static_cast<size_t>(sj)]) continue;
+                const float* xf = reinterpret_cast<const float*>(&in.fdl[lv][static_cast<size_t>(sj) * static_cast<size_t>(size)]);
+                const float* hf = reinterpret_cast<const float*>(&K.h[static_cast<size_t>(p) * static_cast<size_t>(size)]);
+                float* af = reinterpret_cast<float*>(L.acc.data());
+                if (!any) {
+                    for (int i = 0; i < size; ++i) {
+                        af[2 * i] = xf[2 * i] * hf[2 * i] - xf[2 * i + 1] * hf[2 * i + 1];
+                        af[2 * i + 1] = xf[2 * i] * hf[2 * i + 1] + xf[2 * i + 1] * hf[2 * i];
+                    }
+                    any = true;
+                } else {
+                    for (int i = 0; i < size; ++i) {
+                        af[2 * i] += xf[2 * i] * hf[2 * i] - xf[2 * i + 1] * hf[2 * i + 1];
+                        af[2 * i + 1] += xf[2 * i] * hf[2 * i + 1] + xf[2 * i + 1] * hf[2 * i];
+                    }
+                }
+            }
+        }
+        if (any) L.fft->Run(L.acc.data(), true);
+        (void)n;
+        return any;
+    }
+
+    int block_ = 0, ring_ = 1, used_ = 0;
+    uint64_t blockIndex_ = 0;
+    std::vector<Level> levels_;
+    std::vector<Input> inputs_;
+    std::vector<int> free_;
+};
+
 }  // namespace bus
 }  // namespace svms
