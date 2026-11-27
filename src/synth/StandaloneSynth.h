@@ -424,13 +424,13 @@ public:
         if (busOn_)
             std::fprintf(stderr, "[SVMS] release bus: %llu same-block and %llu handed-off notes of %llu, %.1f MB of "
                          "kernels, %u regions refused, "
-                         "%.0f convolutions per block, %llu mix moves; ms per audio second: %.0f convolving, %.0f mixing, "
+                         "%.0f convolutions per block, %llu mix moves (%.0f ms per audio second); ms per audio second: %.0f convolving, %.0f mixing, "
                          "%.0f planning, %.0f building kernels\n",
                          (unsigned long long)busNotes_, (unsigned long long)busHanded_,
                          (unsigned long long)noteCalls_,
                          busKernels_.Bytes() / 1e6, busKernels_.Refused(),
                          bus_.Blocks() ? double(bus_.Convolved()) / double(bus_.Blocks()) : 0.0, (unsigned long long)bus_.Moves(),
-                         BusMsPerSecond(bus_.BusNs()), BusMsPerSecond(busRenderNs_ - bus_.BusNs()),
+                         BusMsPerSecond(bus_.MoveNs()), BusMsPerSecond(bus_.BusNs()), BusMsPerSecond(busRenderNs_ - bus_.BusNs()),
                          BusMsPerSecond(busPlanNs_), BusMsPerSecond(busKernels_.BuildNs()));
         // Opt-in end-of-session diagnostic: every plan refusal is a skipped
         // stretch (silence), so a real file should report zero.
@@ -1372,6 +1372,7 @@ private:
         busSets_.clear();
         busSetIds_.clear();
         busSetOf_.clear();
+        busSetCache_.assign(4096, BusSetCache{});
         // A kernel key names a font, a region set (busSets_) and a key. Inline mode: built on this thread, so the
         // set registry needs no lock.
         busKernels_.Start([this](uint64_t key, std::vector<bus::KernelSource>& sources) {
@@ -1401,32 +1402,38 @@ private:
         const uint32_t preset = channels_.GetSelectedPreset(channel);
         const uint32_t font = selFont_[channel];
         if (font >= banks_.size() || preset >= banks_[font].data->presetCount) return nullptr;
-        const Bank& bank = banks_[font];
-        const SFSampleRegion* regions[8];
-        const uint32_t n = ResolveRegions(font, preset, note, velocity, regions, 8);
-        if (n == 0u || n > 8u) return nullptr;
-        // One kernel for the note's whole region set (a stereo pair is one convolution, not two).
+        // One kernel for the note's whole region set (a stereo pair is one convolution, not two). The set comes
+        // through a direct-mapped cache in front of the map (whose hash was 2% of a shard thread); a hit needs no
+        // region lookup either.
         const uint64_t tag = (uint64_t(font) << 32) | (uint64_t(preset) << 15) | (uint32_t(note) << 7) | velocity;
-        auto known = busSetOf_.find(tag);
-        if (known == busSetOf_.end()) {
-            std::vector<uint32_t> locals(n);
-            for (uint32_t i = 0; i < n; ++i) {
-                locals[i] = uint32_t(regions[i] - bank.data->regions);
-                const uint32_t index = bank.regionBase + locals[i];
-                if (index >= prepared_.size() || !prepared_[index].valid) return nullptr;
+        BusSetCache& cached = busSetCache_[size_t((tag * 0x9E3779B97F4A7C15ull) >> 52)];
+        if (cached.tag != tag) {
+            const Bank& bank = banks_[font];
+            const SFSampleRegion* regions[8];
+            const uint32_t n = ResolveRegions(font, preset, note, velocity, regions, 8);
+            if (n == 0u || n > 8u) return nullptr;
+            auto known = busSetOf_.find(tag);
+            if (known == busSetOf_.end()) {
+                std::vector<uint32_t> locals(n);
+                for (uint32_t i = 0; i < n; ++i) {
+                    locals[i] = uint32_t(regions[i] - bank.data->regions);
+                    const uint32_t index = bank.regionBase + locals[i];
+                    if (index >= prepared_.size() || !prepared_[index].valid) return nullptr;
+                }
+                auto id = busSetIds_.find(locals);
+                if (id == busSetIds_.end()) {
+                    id = busSetIds_.emplace(locals, uint32_t(busSets_.size())).first;
+                    busSets_.push_back(locals);
+                }
+                known = busSetOf_.emplace(tag, id->second).first;
             }
-            auto id = busSetIds_.find(locals);
-            if (id == busSetIds_.end()) {
-                id = busSetIds_.emplace(locals, uint32_t(busSets_.size())).first;
-                busSets_.push_back(locals);
-            }
-            known = busSetOf_.emplace(tag, id->second).first;
+            cached = {tag, known->second, n};
         }
         // A retire floor raised above the default shortens a voice's release to where it would reach the floor
         // (FloorLimitedReleaseSamples). That saves voice time; a bus tail costs nothing more to keep, so the bus
         // lets it ring to its natural end, as at the default floor. The difference is under the floor.
-        kernelKey = bus::KernelKey(font, known->second, note);
-        layers = n;
+        kernelKey = bus::KernelKey(font, cached.set, note);
+        layers = cached.layers;
         return busKernels_.Get(kernelKey);
     }
 
@@ -2100,9 +2107,24 @@ private:
     bool busAheadOn_ = false;     // pairs come from the lookahead (FeedAhead), not the call
     uint64_t busAheadFront_ = 0;  // lookahead events before this frame are fed
     struct BusOpen { uint64_t on; uint32_t epoch; };
+    // A queue taken from either end, in one vector (a deque of 16-byte items allocates each one, on MSVC).
+    struct BusOpens {
+        std::vector<BusOpen> v;
+        size_t head = 0;
+        bool empty() const noexcept { return head == v.size(); }
+        const BusOpen& front() const noexcept { return v[head]; }
+        const BusOpen& back() const noexcept { return v.back(); }
+        void push_back(const BusOpen& o) {
+            if (head > 64u && 2u * head > v.size()) { v.erase(v.begin(), v.begin() + std::ptrdiff_t(head)); head = 0; }
+            v.push_back(o);
+        }
+        void pop_front() noexcept { if (++head == v.size()) clear(); }
+        void pop_back() noexcept { v.pop_back(); if (head == v.size()) clear(); }
+        void clear() noexcept { v.clear(); head = 0; }
+    };
     static constexpr uint64_t kTaken = UINT64_MAX;   // BusKey::pairs: taken, or its note-on is past
     struct BusKey {
-        std::deque<BusOpen> open;                          // note-ons not yet ended, in order (lookahead time)
+        BusOpens open;                                     // note-ons not yet ended, in order (lookahead time)
         std::vector<std::pair<uint64_t, uint64_t>> pairs;  // (on, off) the bus can take, from `head` on; taken or past
                                                            // ones have on = kTaken
         size_t head = 0;
@@ -2115,6 +2137,8 @@ private:
     std::vector<std::vector<uint32_t>> busSets_;           // set id -> its regions (bank-local indices)
     std::map<std::vector<uint32_t>, uint32_t> busSetIds_;  // regions -> set id
     std::unordered_map<uint64_t, uint32_t> busSetOf_;      // font, preset, key, velocity -> set id
+    struct BusSetCache { uint64_t tag = UINT64_MAX; uint32_t set = 0, layers = 0; };
+    std::vector<BusSetCache> busSetCache_;                 // busSetOf_ in front, direct-mapped (BusKernel)
     // Handoff (late notes). A candidate's note-off must come within kHandoffBlocks of its note-on, which leaves
     // its voices a block to stop in before t0 + 8 blocks.
     static constexpr uint32_t kHandoffBlocks = 6u;

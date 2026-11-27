@@ -126,8 +126,7 @@ private:
         in.lastInput = (std::max)(in.lastInput, on);
         g.active = true;
         if (!share_) return;
-        Hist& hs = h.hist[kernelKey];
-        hs.k = k;
+        Hist& hs = HistOf(h, kernelKey, k);   // InputOf gave the kernel its index
         hs.imps.emplace_back(on, w);
         if (hs.imps.size() >= 2u * hs.keep) { Prune(hs); hs.keep = (std::max)(size_t(64), hs.imps.size()); }
     }
@@ -244,6 +243,7 @@ public:
     uint64_t Convolved() const noexcept { return convolved_; }   // input-blocks
     uint64_t BusNs() const noexcept { return busNs_; }
     uint64_t Moves() const noexcept { return moves_; }   // channels moved out of a shared group with their tails
+    uint64_t MoveNs() const noexcept { return moveNs_; }   // within the bus times above (MoveOut runs in all of them)
 
 private:
     struct In { const ReleaseKernel* kernel; int id; uint64_t lastInput; };
@@ -264,7 +264,7 @@ private:
         bool active = false, preLive = false;
     };
     // A channel's sound in its group, kept while sharing so it can move: impulses per kernel, direct parts.
-    struct Hist { const ReleaseKernel* k = nullptr; std::vector<std::pair<uint64_t, float>> imps; size_t keep = 64; };
+    struct Hist { const ReleaseKernel* k = nullptr; uint64_t key = 0; std::vector<std::pair<uint64_t, float>> imps; size_t keep = 64; };
     struct Dir { const ReleaseKernel* k; uint64_t on, from; uint32_t held; float v, w; };
     struct Chan {
         float L = 0.0f, R = 0.0f, prevL = 0.0f, prevR = 0.0f;   // as Group's
@@ -273,7 +273,8 @@ private:
         uint64_t until = 0;     // its sound there ends before this
         bool pending = false;   // its last change (at `changed`) is not yet the group's
         uint64_t cutAt = UINT64_MAX;   // a cut in a shared group, done when its block is processed
-        std::unordered_map<uint64_t, Hist> hist;
+        std::vector<Hist> hist;            // by kernel busIndex; the ones in use (k set) listed in histUsed
+        std::vector<uint32_t> histUsed;
         std::vector<Dir> dirs;
         size_t dirsKeep = 64;
     };
@@ -308,8 +309,16 @@ private:
                                      [&](const std::pair<uint64_t, float>& x) { return x.first + len <= outFrom_; }),
                       hs.imps.end());
     }
+    static Hist& HistOf(Chan& h, uint64_t kernelKey, const ReleaseKernel* k) {
+        const size_t i = static_cast<size_t>(k->busIndex);
+        if (h.hist.size() <= i) h.hist.resize(i + 1);
+        Hist& hs = h.hist[i];
+        if (!hs.k) { hs.k = k; hs.key = kernelKey; h.histUsed.push_back(uint32_t(i)); }
+        return hs;
+    }
     static void Forget(Chan& h) {
-        h.hist.clear();
+        for (uint32_t i : h.histUsed) { Hist& hs = h.hist[i]; hs.k = nullptr; hs.imps.clear(); hs.keep = 64; }
+        h.histUsed.clear();
         h.dirs.clear();
         h.pending = false;
         h.cutAt = UINT64_MAX;
@@ -397,6 +406,7 @@ private:
     // Takes the channel's sound from `from` on out of its group: into a group of its gains (`keep`), or nowhere (a
     // cut). Frames before `from` stay; `from` is not before the processed block.
     void MoveOut(Chan& h, bool keep, uint64_t from) {
+        const auto t0 = std::chrono::steady_clock::now();
         const int gi = h.g;
         Group& g = *groups_[size_t(gi)];
         const int hi = keep ? Pick(h, gi) : -1;
@@ -406,11 +416,13 @@ private:
         const uint32_t offset = static_cast<uint32_t>((std::min)(from - open, static_cast<uint64_t>(block_)));
         float* const gPre[2] = {g.pre[0].data(), g.pre[1].data()};
         float* const tPre[2] = {to ? to->pre[0].data() : nullptr, to ? to->pre[1].data() : nullptr};
-        for (auto& [key, hs] : h.hist) {
+        for (uint32_t hi2 : h.histUsed) {
+            Hist& hs = h.hist[hi2];
+            const uint64_t key = hs.key;
             Prune(hs);
             if (hs.imps.empty()) continue;
-            auto it = g.inputs.find(key);
-            if (it == g.inputs.end()) continue;   // expired with its impulses
+            if (hi2 >= g.fast.size() || !g.fast[hi2]) continue;   // expired with its impulses
+            In* const fromIn = g.fast[hi2];
             int toId = -1;
             if (to) {
                 In& in = InputOf(*to, key, hs.k);
@@ -418,7 +430,7 @@ private:
                 toId = in.id;
                 to->active = true;
             }
-            ConvBank::Move(g.bank, it->second.id, to ? &to->bank : nullptr, toId, hs.imps.data(), hs.imps.size(),
+            ConvBank::Move(g.bank, fromIn->id, to ? &to->bank : nullptr, toId, hs.imps.data(), hs.imps.size(),
                            processedEnd_ / block_, offset, gPre, tPre);
         }
         for (const Dir& d : h.dirs) {
@@ -437,6 +449,7 @@ private:
             h.g = -1;
         }
         ++moves_;
+        moveNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
 
     // Frames [from, end of the note's direct span) of a note's direct part, times `sign`.
@@ -580,7 +593,7 @@ private:
     std::vector<std::unique_ptr<Group>> groups_;
     Chan chan_[kChannels];
     int nextIndex_ = 0;   // the next kernel busIndex
-    uint64_t notes_ = 0, blocks_ = 0, convolved_ = 0, busNs_ = 0, moves_ = 0;
+    uint64_t notes_ = 0, blocks_ = 0, convolved_ = 0, busNs_ = 0, moves_ = 0, moveNs_ = 0;
 };
 
 }  // namespace bus
