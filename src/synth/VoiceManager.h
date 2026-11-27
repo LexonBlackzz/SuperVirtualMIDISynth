@@ -859,6 +859,7 @@ public:
     // boundary, before worker jobs can observe voice state.
     void ApplyRuntimeVoiceLimit(uint64_t frame);
     void SetCurrentFrame(uint64_t frame);
+    uint64_t GetCurrentFrame() const { return currentFrame_; }
     void SetStealKeyBackend(RenderBackend backend) {
         stealKeyBackend_ = backend;
     }

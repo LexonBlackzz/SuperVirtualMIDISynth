@@ -601,12 +601,16 @@ public:
     // touch SetCurrentFrame — the renderer owns the render clock, matching
     // Driver::DispatchRenderEvent. ChannelPressure has no standalone
     // handler (parity with Dispatch()'s switch); it is consumed as a no-op.
+    // The event's frame is the render clock's, not the block start plus
+    // the cursor: a block split into stretches passes cursors relative to
+    // the stretch.
     static void DispatchRenderEventStatic(const RenderEvent& event,
-                                          uint32_t blockCursor,
+                                          uint32_t /*blockCursor*/,
                                           void* userData) {
         StandaloneSynth* self = static_cast<StandaloneSynth*>(userData);
         if (!self) return;
-        self->busFrame_ = self->dispatchAbsoluteFrame_ + blockCursor;
+        const uint64_t frame = self->voices_.GetCurrentFrame();
+        self->busFrame_ = frame;
         switch (event.type) {
         case RenderEventType::NoteOn: {
             // Same-key coalescing in the audio-frame domain — the offline
@@ -618,7 +622,7 @@ public:
                 static_cast<uint32_t>(event.channel) * kNoteCount + event.data1;
             uint32_t stack = 0u;
             if (!self->noteOnCollapse_.OnNoteOn(
-                    keyIndex, self->dispatchAbsoluteFrame_ + blockCursor,
+                    keyIndex, frame,
                     stack)) {
                 // Re-excite: the hit is not dropped, it restarts the key's
                 // live voices right here at its exact frame. With no live
@@ -626,7 +630,7 @@ public:
                 if (self->reExcite_) {
                     if (!self->noteOnCollapse_.AllowReExcite(
                             keyIndex,
-                            self->dispatchAbsoluteFrame_ + blockCursor)) {
+                            frame)) {
                         ++self->coalescedNoteOns_;
                         break;
                     }
@@ -696,7 +700,6 @@ public:
         }
         std::fill(left, left + frameCount, 0.0f);
         std::fill(right, right + frameCount, 0.0f);
-        dispatchAbsoluteFrame_ = absoluteFrame;
         if (noteMerge_ && eventCount > 1u) {
             mergeScratch_.assign(events, events + eventCount);
             uint64_t folded = 0u;
@@ -779,7 +782,6 @@ public:
         if (half != 0u) {
             float* const bodyL = halfBlock_[0].data() + kHist;
             float* const bodyR = halfBlock_[1].data() + kHist;
-            dispatchAbsoluteFrame_ = k0;
             const RenderEvent* run = halfEvents_.data();
             uint32_t runCount = static_cast<uint32_t>(halfEvents_.size());
             if (noteMerge_ && runCount > 1u) {
@@ -870,7 +872,6 @@ public:
     }
 
     void SetCursor(uint64_t absoluteFrame) {
-        dispatchAbsoluteFrame_ = EngineFrame(absoluteFrame);
         voices_.SetCurrentFrame(EngineFrame(absoluteFrame));
     }
 
@@ -1004,6 +1005,7 @@ public:
         renderer_.SetBulkAdmissionPercent(t.bulkAdmissionPercent);
     }
     bool LeanVoicesForTest() const { return renderer_.LeanVoices(); }
+    void SetRowOpBudgetForTest(uint32_t budget) { renderer_.SetRowOpBudgetForTest(budget); }
 
     uint64_t WholeVoiceBlocksForTest() const {
         return renderer_.GetWholeVoiceBlocksForTest();
@@ -1024,13 +1026,11 @@ private:
     // built up front so LaunchVoiceGroup can resolve the batched victim
     // selection once for the whole note-on (production launch path).
     VoiceConfiguration launchSetups_[512];
-    // Same-key note-on coalescing (audio-frame domain) + the absolute frame
-    // the dispatcher's blockCursor offsets from. See Initialize.
+    // Same-key note-on coalescing (audio-frame domain). See Initialize.
     NoteOnCollapseGate noteOnCollapse_;
     uint64_t coalescedNoteOns_ = 0;
     uint64_t reExcitedNoteOns_ = 0;
     bool reExcite_ = false;
-    uint64_t dispatchAbsoluteFrame_ = 0;
     // Exact note-on merging (see Initialize / RenderWithEvents).
     bool noteMerge_ = false;
     bool nestedNoteOff_ = false;  // a note-off ends the newest open note

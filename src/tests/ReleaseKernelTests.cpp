@@ -286,6 +286,7 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
         if (!keep->Initialize(cfg, error)) { std::printf("FAIL  bus init: %s\n", error.c_str()); ++g_failures; return; }
         keep->SetRawMix(true);
         keep->SetReleaseBusSharing(share);
+        if (features & 128) keep->SetRowOpBudgetForTest(0);   // 128: every mix CC splits its block into stretches
         const uint32_t lookahead = (features & 64) ? keep->EnableBusLookahead() : 0u;
         RealtimeBlockRenderer blocks;
         l.assign(frames, 0.0f);
@@ -379,6 +380,8 @@ int main() {
     RunBus(sf2, 64, "lookahead");
     RunBus(sf2, 79, "lookahead, everything");
     RunBus(sf2, 127, "lookahead, one mix, everything");
+    RunBus(sf2, 129, "mix automation, split blocks");
+    RunBus(sf2, 193, "lookahead, mix automation, split blocks");
     std::remove(path.c_str());
     std::printf(g_failures ? "%d FAILED\n" : "all passed\n", g_failures);
     return g_failures ? 1 : 0;
