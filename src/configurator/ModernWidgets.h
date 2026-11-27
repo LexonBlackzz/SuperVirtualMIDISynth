@@ -182,21 +182,6 @@ bool NumberField(const char* id, int* value, int minValue, int maxValue,
 bool RangeSlider(const char* id, float* value, float minValue, float maxValue,
                  float width, bool* committed = nullptr);
 
-// Shortcut tile for the Performance grid: title + toggle, description, tags
-// pinned to the bottom. Returns *on; nested content starts with TileNested()
-// (the dashed divider). Always close with EndTile().
-// With `on == nullptr` the toggle gives way to `readout` (mono, accent) and the
-// tile's lit state is `lit`: for tiles that hold a slider instead of a switch.
-bool BeginTile(const char* anchor, const char* title, const char* desc,
-               bool* on, bool* changed, const ChipDef* tags, int tagCount,
-               float toggleDelay = 0.0f, const char* readout = nullptr,
-               bool lit = false);
-void TileNested();
-void EndTile();
-// Two-column grid of tiles with equal row heights.
-void BeginTileGrid(const char* id);
-void EndTileGrid();
-
 } // namespace svms::cfg::ui
 
 #endif
