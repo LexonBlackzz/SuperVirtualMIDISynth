@@ -263,6 +263,30 @@ bool MovedImpulses(int at, int offset, bool drop, unsigned seed, bool level0 = f
     return ok;
 }
 
+// The depth-first Run gives the bits of the passes run one at a time, forward and inverse, with and without AVX.
+bool FftDepthFirstMatchesPasses() {
+    std::mt19937 rng(13);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    bool ok = true;
+    for (int avx = 0; avx < 2; ++avx) {
+        svms::bus::busScalarOnly = avx == 0;
+        for (int n : {8, 2048, 4096, 65536, 131072}) {
+            const svms::bus::SplitFft fft(n);
+            std::vector<svms::bus::Cf> x(static_cast<size_t>(n));
+            for (auto& c : x) c = svms::bus::Cf(u(rng), u(rng));
+            for (int inverse = 0; inverse < 2; ++inverse) {
+                std::vector<svms::bus::Cf> a = x, b = x;
+                fft.Run(a.data(), inverse != 0);
+                for (int s = 1; s <= fft.Bits(); ++s) fft.Pass(b.data(), s, inverse != 0);
+                ok = ok && std::memcmp(a.data(), b.data(), sizeof(svms::bus::Cf) * a.size()) == 0;
+            }
+        }
+    }
+    svms::bus::busScalarOnly = false;
+    std::printf("%s depth-first fft equals pass by pass: bit for bit\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 // The AVX products and butterflies give the scalar loops' bits (renders do not depend on the CPU).
 bool AvxMatchesScalar() {
     if (!svms::bus::BusAvx()) { std::printf("SKIP avx equals scalar: no AVX\n"); return true; }
@@ -429,6 +453,7 @@ int main(int argc, char** argv) {
     ok &= MovedImpulses(133, 63, false, 82, true, 4, 2);
     ok &= MovedImpulses(201, 50, true, 83, true, 8, 1);
     ok &= AvxMatchesScalar();
+    ok &= FftDepthFirstMatchesPasses();
     ok &= ParallelMatchesSerial();
     ok &= EvenWork();
     std::printf(ok ? "all release convolver tests passed\n" : "release convolver tests FAILED\n");

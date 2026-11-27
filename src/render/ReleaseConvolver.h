@@ -137,14 +137,49 @@ public:
 
     void Pass(Cf* x, int s, bool inverse) const noexcept {
         if (s == 0) return;
-        const int half = inverse ? 1 << (s - 1) : 1 << (bits_ - s), len = half << 1;
-        float* f = reinterpret_cast<float*>(x);
+        PassOn(reinterpret_cast<float*>(x), n_, inverse ? 1 << (s - 1) : 1 << (bits_ - s), inverse);
+    }
+    // Every pass, depth first: once a sub-transform fits in L1 (kSmall points) its passes run there. Each butterfly
+    // gets the same inputs as pass by pass, so the result is the same bits.
+    void Run(Cf* x, bool inverse) const noexcept {
+        if (inverse) RunInverse(reinterpret_cast<float*>(x), n_);
+        else RunForward(reinterpret_cast<float*>(x), n_);
+    }
+
+    static int Partner(int p) noexcept {
+        if (p < 2) return p;
+        int lo = 2;
+        while (lo * 2 <= p) lo <<= 1;
+        return 3 * lo - 1 - p;
+    }
+
+private:
+    static constexpr int kSmall = 2048;
+
+    // Forward (decimation in frequency): the span of `count` first, then each half; the inverse the other way.
+    void RunForward(float* f, int count) const noexcept {
+        if (count <= kSmall) { for (int half = count / 2; half >= 1; half /= 2) PassOn(f, count, half, false); return; }
+        PassOn(f, count, count / 2, false);
+        RunForward(f, count / 2);
+        RunForward(f + count, count / 2);   // floats: count / 2 complex values on
+    }
+    void RunInverse(float* f, int count) const noexcept {
+        if (count <= kSmall) { for (int half = 1; half < count; half *= 2) PassOn(f, count, half, true); return; }
+        RunInverse(f, count / 2);
+        RunInverse(f + count, count / 2);
+        PassOn(f, count, count / 2, true);
+    }
+
+    // The butterflies of span 2 half over the `count` complex values at f (interleaved floats).
+    void PassOn(float* f, int count, int half, bool inverse) const noexcept {
+        const int len = half << 1;
         const float* wf = reinterpret_cast<const float*>(&tw_[static_cast<size_t>(half - 1)]);
 #if defined(SVMS_BUS_AVX)
-        if (n_ >= 8 && BusAvx()) return half >= 4 ? PassAvx(f, wf, half, inverse) : PassAvxSmall(f, wf, half, inverse);
+        if (count >= 8 && BusAvx())
+            return half >= 4 ? PassAvx(f, count, wf, half, inverse) : PassAvxSmall(f, count, wf, half, inverse);
 #endif
         const float sign = inverse ? -1.0f : 1.0f;
-        for (int i = 0; i < n_; i += len) {
+        for (int i = 0; i < count; i += len) {
             float* a = f + 2 * i;
             float* b = f + 2 * (i + half);
             for (int k = 0; k < half; ++k) {
@@ -164,18 +199,7 @@ public:
             }
         }
     }
-    void Run(Cf* x, bool inverse) const noexcept {
-        for (int s = 1; s <= bits_; ++s) Pass(x, s, inverse);
-    }
 
-    static int Partner(int p) noexcept {
-        if (p < 2) return p;
-        int lo = 2;
-        while (lo * 2 <= p) lo <<= 1;
-        return 3 * lo - 1 - p;
-    }
-
-private:
 #if defined(SVMS_BUS_AVX)
     // One butterfly of either kind on four lanes; the scalar loop's arithmetic.
     SVMS_BUS_AVX_FN static void Butterfly(__m256& a, __m256& b, __m256 w, bool inverse) noexcept {
@@ -194,9 +218,9 @@ private:
         return inverse ? _mm256_xor_ps(w, _mm256_setr_ps(0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f)) : w;
     }
     // Spans of 8 and more, four butterflies at a time.
-    SVMS_BUS_AVX_FN void PassAvx(float* f, const float* wf, int half, bool inverse) const noexcept {
+    SVMS_BUS_AVX_FN void PassAvx(float* f, int count, const float* wf, int half, bool inverse) const noexcept {
         const int len = half << 1;
-        for (int i = 0; i < n_; i += len) {
+        for (int i = 0; i < count; i += len) {
             float* a = f + 2 * i;
             float* b = f + 2 * (i + half);
             for (int k = 0; k < half; k += 4) {
@@ -208,7 +232,7 @@ private:
         }
     }
     // Spans of 2 and 4: eight values at a time, regrouped so each lane pairs an a with its b.
-    SVMS_BUS_AVX_FN void PassAvxSmall(float* f, const float* wf, int half, bool inverse) const noexcept {
+    SVMS_BUS_AVX_FN void PassAvxSmall(float* f, int count, const float* wf, int half, bool inverse) const noexcept {
         __m256 w;
         if (half == 1) {
             w = _mm256_castpd_ps(_mm256_broadcast_sd(reinterpret_cast<const double*>(wf)));
@@ -217,7 +241,7 @@ private:
             w = _mm256_insertf128_ps(_mm256_castps128_ps256(w2), w2, 1);
         }
         if (inverse) w = _mm256_xor_ps(w, _mm256_setr_ps(0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f, -0.0f));
-        for (int i = 0; i < n_; i += 8) {
+        for (int i = 0; i < count; i += 8) {
             const __m256 v0 = _mm256_loadu_ps(f + 2 * i), v1 = _mm256_loadu_ps(f + 2 * i + 8);
             __m256 a, b;
             if (half == 1) {   // pairs (0 1) (2 3) | (4 5) (6 7): a = [0 4 2 6], b = [1 5 3 7]
