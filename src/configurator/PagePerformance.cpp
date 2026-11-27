@@ -380,7 +380,7 @@ void CpuCard(ConfigDocument& doc) {
     {
         const ImVec2 size(258.0f * s, 28.0f * s);
         ui::BeginRow("renderCap", "Render time cap",
-                     "The most of each audio block the synth may spend rendering. While it stays under, nothing changes. When a passage would take longer, only the loudest new notes start, so playback keeps up instead of stuttering; notes already playing, controllers and note-offs are never touched. 80% leaves room for the rest of the PC. Off plays every note even if the audio falls behind.",
+                     "Over this share of each block, quiet voices and new notes are dropped to keep up.",
                      size);
         int v = static_cast<int>(w.renderCapPercent);
         if (SliderControl("##rendercap", &v, 0, 100, "Off", size)) {
