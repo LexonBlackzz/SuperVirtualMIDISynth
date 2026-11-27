@@ -58,6 +58,10 @@ public:
     uint32_t Direct() const noexcept { return kDirectBlocks * block_; }
     // Off: every channel keeps a group of its own (the bus before groups; tests compare the two).
     void SetSharing(bool on) noexcept { share_ = on; }
+    // On: the kernels keep level 0 (KernelStore keepLevel0), so a note's direct part is a correction of its held
+    // frames only. Every note must then come at its note-on (AddNote); late impulses cannot join level 0.
+    void SetLevel0(bool on) noexcept { level0_ = on; }
+    bool Level0() const noexcept { return level0_; }
 
     // Whether a note on `channel` at `frame` can still join as a same-block note.
     bool Open(uint8_t channel, uint64_t frame) const noexcept {
@@ -99,7 +103,7 @@ public:
     // The direct part of a note, frames [from, on + D): v * A(tau) while held, v * A(tau) * r^(tau - held + 1)
     // after. `from` must not be output yet.
     void AddDirect(const ReleaseKernel* k, uint8_t channel, uint64_t on, uint32_t held, float v, uint64_t from) {
-        const uint64_t end = DirectEnd(k, on);
+        const uint64_t end = DirectEnd(k, on, held);
         const uint64_t open = processedEnd_ - (processedEnd_ ? block_ : 0u);   // start of the processed block
         if (from < open) from = open;   // already output: cannot change
         if (from >= end) return;
@@ -110,7 +114,7 @@ public:
         h.dirs.push_back({k, on, from, held, v});
         if (h.dirs.size() >= 2u * h.dirsKeep) {
             h.dirs.erase(std::remove_if(h.dirs.begin(), h.dirs.end(),
-                                        [&](const Dir& d) { return DirectEnd(d.k, d.on) <= outFrom_; }),
+                                        [&](const Dir& d) { return DirectEnd(d.k, d.on, d.held) <= outFrom_; }),
                          h.dirs.end());
             h.dirsKeep = (std::max)(size_t(64), h.dirs.size());
         }
@@ -254,7 +258,9 @@ private:
         if (it == g.inputs.end()) it = g.inputs.emplace(kernelKey, In{k, g.bank.Add(k->tail), 0u}).first;
         return it->second;
     }
-    uint64_t DirectEnd(const ReleaseKernel* k, uint64_t on) const noexcept {
+    // With level 0 the convolution covers every frame and the direct part only corrects the held ones.
+    uint64_t DirectEnd(const ReleaseKernel* k, uint64_t on, uint32_t held) const noexcept {
+        if (level0_) return on + held;
         return on + (std::min)(static_cast<uint64_t>(Direct()), static_cast<uint64_t>(k->heldFrames));
     }
     void Prune(Hist& hs) const {
@@ -396,18 +402,19 @@ private:
 
     // Frames [from, end of the note's direct span) of a note's direct part, times `sign`.
     void DirectInto(Group& g, const ReleaseKernel* k, uint64_t on, uint32_t held, float v, uint64_t from, float sign) {
-        const uint64_t end = DirectEnd(k, on);
+        const uint64_t end = DirectEnd(k, on, held);
         const uint64_t open = processedEnd_ - (processedEnd_ ? block_ : 0u);
         if (from < open) from = open;
         if (from >= end) return;
         const double r = k->releaseDecay;
         uint32_t t = static_cast<uint32_t>(from - on);
-        // r^(tau - held + 1) at the first released frame on or after `from`.
-        double p = std::pow(r, static_cast<double>((std::max)(t, held)) - static_cast<double>(held) + 1.0);
+        // r^(tau - held + 1) at the first released frame on or after `from`; with level 0, at `from` itself.
+        double p = std::pow(r, static_cast<double>(level0_ ? t : (std::max)(t, held)) - static_cast<double>(held) + 1.0);
         uint32_t slot = static_cast<uint32_t>(from % ring_);
         for (uint64_t f = from; f < end; ++f, ++t, slot = slot + 1u == ring_ ? 0u : slot + 1u) {
-            const float gain = static_cast<float>(t < held ? v : v * p) * sign;
-            if (t >= held) p *= r;
+            // Level 0: while held the convolution gives w B = v A r^(tau - held + 1) where the note is v A.
+            const float gain = static_cast<float>(level0_ ? v * (1.0 - p) : t < held ? v : v * p) * sign;
+            if (level0_ || t >= held) p *= r;
             const float l = k->heldL[t] * gain, rr = k->heldR[t] * gain;
             if (f < processedEnd_) {
                 g.pre[0][static_cast<size_t>(f - open)] += l;
@@ -496,6 +503,7 @@ private:
     uint64_t processedEnd_ = 0;    // the grid block before this is processed; this one is open
     uint64_t outFrom_ = 0;         // the next frame Render outputs
     bool share_ = true;
+    bool level0_ = false;
     std::vector<std::unique_ptr<Group>> groups_;
     Chan chan_[kChannels];
     uint64_t notes_ = 0, blocks_ = 0, convolved_ = 0, busNs_ = 0, moves_ = 0;

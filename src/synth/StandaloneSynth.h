@@ -386,6 +386,25 @@ public:
         return bus_.Blocks() ? double(bus_.Convolved()) / double(bus_.Blocks()) : 0.0;
     }
     void SetReleaseBusSharing(bool on) { bus_.SetSharing(on); }
+    // A host that knows what is coming (the offline renderer) calls EnableBusLookahead before rendering, then gives
+    // every event from each render call's first frame to the returned frames past its end, sorted, before the
+    // call (SetBusLookahead), and clears it after. The bus pairs a note-on with a note-off that far ahead (the
+    // engine's pairing, run ahead: FeedAhead), so an eligible note shorter than its direct span never takes a voice,
+    // and its kernels keep level 0: such a note costs a correction of its held frames, not its first 8 blocks.
+    // Handoffs stop (a late impulse cannot join level 0). Without it, pairs stay within a call. 0: no bus.
+    uint32_t EnableBusLookahead() {
+        if (!busOn_) return 0u;
+        if (!busAheadOn_) {
+            busAheadOn_ = true;
+            StartBusKernels();
+        }
+        return bus_.Direct();
+    }
+    void SetBusLookahead(const RealtimeEvent* events, size_t count) {
+        busAhead_ = events;
+        busAheadCount_ = count;
+    }
+    uint32_t BusLookaheadFrames() const { return busOn_ && busAheadOn_ ? bus_.Direct() : 0u; }
     size_t ReleaseBusHistories() const { return bus_.Histories(); }
     size_t ReleaseBusKernelBytes() const { return busKernels_.Bytes(); }
     double BusMsPerSecond(uint64_t ns) const {
@@ -887,6 +906,7 @@ public:
             bus_.Reset(absoluteFrame);
             std::fill(keyHeld_.begin(), keyHeld_.end(), 0u);
             std::fill(busOff_.begin(), busOff_.end(), UINT64_MAX);
+            for (BusKey& k : busKeys_) k.offs.clear();   // the lookahead's pairing (open, pairs) is ahead of this
             busLate_.clear();
             busLateOrder_.clear();
             busKill_.clear();
@@ -1301,6 +1321,18 @@ private:
         keyHeld_.assign(size_t(kChannelCount) * kNoteCount, 0u);
         busOff_.assign(size_t(kChannelCount) * kNoteCount, UINT64_MAX);
         busPend_.assign(size_t(kChannelCount) * kNoteCount, BusPend{});
+        busKeys_.assign(size_t(kChannelCount) * kNoteCount, BusKey{});
+        busAheadFront_ = 0;   // a lookahead stays on (EnableBusLookahead); its pairing starts over
+        StartBusKernels();
+        busLate_.clear();
+        busLateOrder_.clear();
+        busKill_.clear();
+        for (uint8_t channel = 0; channel < kChannelCount; ++channel) BusMix(channel);
+    }
+
+    // The kernel store, empty. With a lookahead the kernels keep level 0 (EnableBusLookahead).
+    void StartBusKernels() {
+        bus_.SetLevel0(busAheadOn_);
         busSets_.clear();
         busSetIds_.clear();
         busSetOf_.clear();
@@ -1315,11 +1347,7 @@ private:
                 if (!ReleaseKernelSource(uint32_t(key >> 40), local, uint8_t(key), sources.back())) return false;
             }
             return true;
-        }, bus_.Direct(), int(busBlock_), busBudget_, 3, /*background=*/false);
-        busLate_.clear();
-        busLateOrder_.clear();
-        busKill_.clear();
-        for (uint8_t channel = 0; channel < kChannelCount; ++channel) BusMix(channel);
+        }, bus_.Direct(), int(busBlock_), busBudget_, 3, /*background=*/false, /*keepLevel0=*/busAheadOn_);
     }
 
     // The kernel for a note the bus could take, checking what must hold for the note's whole life: one unit,
@@ -1367,7 +1395,7 @@ private:
 
     // A note that launched as a voice and could hand its tail to the bus at note-off: remember its generation.
     void BusTrack(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t count) {
-        if (!lastNoteLaunched_) return;
+        if (!lastNoteLaunched_ || busAheadOn_) return;   // with the lookahead the bus has level 0: no handoffs
         uint64_t kernelKey = 0;
         uint32_t layers = 0;
         float v = 0.0f;
@@ -1429,59 +1457,120 @@ private:
         bus_.SetMix(channel, busFrame_, cp.mixScaleLeft, cp.mixScaleRight);
     }
 
-    // Pairs each note-on of the call with its note-off when nothing on the channel can change the note between.
+    // Pairs each note-on of the call with its note-off when nothing on the channel can change the note between,
+    // within the bus's direct span: inside the call, or up to that far past it with a host's lookahead.
     void BusPlan(const RenderEvent* events, uint32_t count, uint64_t absoluteFrame) {
         busPlan_.clear();
         ++busCall_;
-        for (uint32_t i = 0; i < count; ++i) {
-            const RenderEvent& e = events[i];
-            const uint8_t c = e.channel & 15u;
-            const uint64_t f = absoluteFrame + e.frameOffset;
-            switch (e.type) {
+        const auto step = [&](RenderEventType type, uint8_t c, uint8_t data1, uint32_t n, uint64_t f) {
+            switch (type) {
             case RenderEventType::NoteOn:
-                if (e.data1 >= kNoteCount) break;
-                busPend_[c * kNoteCount + e.data1] =
-                    e.count > 1u ? BusPend{} : BusPend{f, busCall_, busEpoch_[c]};
+                if (data1 >= kNoteCount) break;
+                busPend_[c * kNoteCount + data1] = n > 1u ? BusPend{} : BusPend{f, busCall_, busEpoch_[c]};
                 break;
             case RenderEventType::NoteOff: {
-                if (e.data1 >= kNoteCount) break;
-                BusPend& p = busPend_[c * kNoteCount + e.data1];
-                if (p.call == busCall_ && p.epoch == busEpoch_[c] && f < bus_.BlockEnd(p.on))
-                    busPlan_.push_back({uint32_t(c * kNoteCount + e.data1), p.on, f});
+                if (data1 >= kNoteCount) break;
+                BusPend& p = busPend_[c * kNoteCount + data1];
+                if (p.call == busCall_ && p.epoch == busEpoch_[c] && f - p.on < bus_.Direct())
+                    busPlan_.push_back({uint32_t(c * kNoteCount + data1), p.on, f});
                 p = BusPend{};
                 break;
             }
             case RenderEventType::ControlChange:
-                if (e.data1 != 7u && e.data1 != 10u && e.data1 != 11u) ++busEpoch_[c];
+                if (data1 != 7u && data1 != 10u && data1 != 11u) ++busEpoch_[c];
                 break;
             default:
                 ++busEpoch_[c];
                 break;
             }
+        };
+        if (busAheadOn_) { FeedAhead(); return; }
+        for (uint32_t i = 0; i < count; ++i) {
+            const RenderEvent& e = events[i];
+            step(e.type, uint8_t(e.channel & 15u), e.data1, e.count, absoluteFrame + e.frameOffset);
         }
         std::sort(busPlan_.begin(), busPlan_.end());
+    }
+
+    // With a host's lookahead: the engine's note-off pairing run ahead of it, each event once, when it first
+    // appears. Each key keeps its open note-ons in order and a note-off ends the oldest (the newest with nested
+    // note-off), as NoteOff does with voices; a bus note has no voice, so the voices left pair as they would.
+    // A note whose note-off comes within the bus's direct span, with nothing between on its channel that can
+    // change it, is a pair the bus can take at its note-on, whatever else the key holds.
+    void FeedAhead() {
+        for (size_t i = 0; i < busAheadCount_; ++i) {
+            const RealtimeEvent& e = busAhead_[i];
+            if (e.targetFrame < busAheadFront_) continue;   // fed with an earlier call
+            const uint8_t status = uint8_t(e.message & 0xffu), c = status & 15u, type = status & 0xf0u;
+            if (e.reset) {
+                for (BusKey& k : busKeys_) k.open.clear();
+                for (uint32_t& x : busEpoch_) ++x;
+                continue;
+            }
+            if (IsInternalEngineMessage(e.message) || status < 0x80u || status >= 0xf0u) {
+                for (uint32_t& x : busEpoch_) ++x;   // a barrier: nothing pairs across it
+                continue;
+            }
+            if (type == 0x80u || type == 0x90u) {
+                const uint32_t note = (e.message >> 8u) & 0xffu;
+                if (note >= kNoteCount) continue;
+                BusKey& k = busKeys_[c * kNoteCount + note];
+                if (type == 0x90u && (e.message & 0x7f0000u)) { k.open.push_back({e.targetFrame, busEpoch_[c]}); continue; }
+                if (k.open.empty()) continue;
+                const BusOpen o = nestedNoteOff_ ? k.open.back() : k.open.front();
+                if (nestedNoteOff_) k.open.pop_back(); else k.open.pop_front();
+                if (o.epoch == busEpoch_[c] && e.targetFrame - o.on < bus_.Direct())
+                    k.pairs.push_back({o.on, e.targetFrame});
+                continue;
+            }
+            const uint32_t cc = (e.message >> 8u) & 0x7fu;
+            if (type == 0xb0u && (cc == 7u || cc == 10u || cc == 11u)) continue;
+            ++busEpoch_[c];
+            if (type == 0xb0u && (cc == 120u || cc == 123u))   // every note on the channel ends (Control)
+                for (uint32_t n = 0; n < kNoteCount; ++n) busKeys_[c * kNoteCount + n].open.clear();
+        }
+        if (busAheadCount_) busAheadFront_ = (std::max)(busAheadFront_, busAhead_[busAheadCount_ - 1].targetFrame + 1u);
     }
 
     bool BusNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t count) {
         if (count > 1u || note >= kNoteCount || channel >= kChannelCount) return false;
         const uint64_t on = busFrame_;
         const uint32_t key = uint32_t(channel) * kNoteCount + note;
-        if (keyHeld_[key] != 0u || !bus_.Open(channel, on)) return false;
-        const auto it = std::lower_bound(busPlan_.begin(), busPlan_.end(), BusPair{key, on, 0u});
-        if (it == busPlan_.end() || it->key != key || it->on != on) return false;
-        const uint64_t off = it->off;
+        uint64_t off = 0;
+        if (busAheadOn_) {
+            auto& pairs = busKeys_[key].pairs;
+            size_t found = SIZE_MAX, keep = 0;
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                if (pairs[i].first < on) continue;   // its note-on is past (merged or refused): drop
+                if (found == SIZE_MAX && pairs[i].first == on) { found = i; off = pairs[i].second; continue; }
+                pairs[keep++] = pairs[i];
+            }
+            pairs.resize(keep);
+            if (found == SIZE_MAX || !bus_.Open(channel, on)) return false;
+        } else {
+            if (keyHeld_[key] != 0u || !bus_.Open(channel, on)) return false;
+            const auto it = std::lower_bound(busPlan_.begin(), busPlan_.end(), BusPair{key, on, 0u});
+            if (it == busPlan_.end() || it->key != key || it->on != on) return false;
+            off = it->off;
+        }
         uint64_t kernelKey = 0;
         uint32_t layers = 0;
         float v = 0.0f;
         const bus::ReleaseKernel* kernel = BusKernel(channel, note, velocity, count, kernelKey, layers, v);
         if (!kernel || off - on >= kernel->heldFrames) return false;
+        // With level 0 the convolution gives the held frames v A r^(tau - held + 1) and the correction takes it back:
+        // a gain of r^(1 - held) on the convolution's rounding. Above 40 dB (a long note with a short release) the
+        // note stays a voice.
+        if (busAheadOn_ && (double(off - on) - 1.0) * -std::log(double(kernel->releaseDecay)) > std::log(100.0))
+            return false;
         bus_.AddNote(kernelKey, kernel, channel, on, uint32_t(off - on), v);
         channels_.NoteOn(channel, note, velocity);
         ++noteCalls_;
         ++notes_;
         ++busNotes_;
-        keyHeld_[key] = 1u;
-        busOff_[key] = off;
+        ++keyHeld_[key];
+        if (busAheadOn_) busKeys_[key].offs.push_back(off);
+        else busOff_[key] = off;
         return true;
     }
 
@@ -1489,9 +1578,17 @@ private:
     bool BusNoteOff(uint8_t channel, uint8_t note) {
         if (note >= kNoteCount || channel >= kChannelCount) return false;
         const uint32_t key = uint32_t(channel) * kNoteCount + note;
-        if (busOff_[key] != busFrame_) return false;
-        busOff_[key] = UINT64_MAX;
-        keyHeld_[key] = 0u;
+        if (busAheadOn_) {
+            auto& offs = busKeys_[key].offs;
+            const auto it = std::find(offs.begin(), offs.end(), busFrame_);
+            if (it == offs.end()) return false;
+            *it = offs.back();
+            offs.pop_back();
+        } else {
+            if (busOff_[key] != busFrame_) return false;
+            busOff_[key] = UINT64_MAX;
+        }
+        if (keyHeld_[key] != 0u) --keyHeld_[key];
         channels_.NoteOff(channel, note);
         return true;
     }
@@ -1732,6 +1829,7 @@ private:
         if (busOn_ && (controller == 120 || controller == 123)) {
             // Every held voice on the channel is gone or released; bus tails stop with all sound off.
             std::fill(keyHeld_.begin() + channel * kNoteCount, keyHeld_.begin() + (channel + 1) * kNoteCount, 0u);
+            for (uint32_t n = 0; n < kNoteCount; ++n) busKeys_[channel * kNoteCount + n].offs.clear();
             if (controller == 120) {
                 bus_.Cut(channel, busFrame_);
                 busKill_.erase(std::remove_if(busKill_.begin(), busKill_.end(),
@@ -1940,6 +2038,17 @@ private:
     };
     std::vector<BusPend> busPend_;
     std::vector<BusPair> busPlan_;
+    const RealtimeEvent* busAhead_ = nullptr;   // the host's lookahead for this call (SetBusLookahead)
+    size_t busAheadCount_ = 0;
+    bool busAheadOn_ = false;     // pairs come from the lookahead (FeedAhead), not the call
+    uint64_t busAheadFront_ = 0;  // lookahead events before this frame are fed
+    struct BusOpen { uint64_t on; uint32_t epoch; };
+    struct BusKey {
+        std::deque<BusOpen> open;                          // note-ons not yet ended, in order (lookahead time)
+        std::vector<std::pair<uint64_t, uint64_t>> pairs;  // (on, off) the bus can take, note-ons still to come
+        std::vector<uint64_t> offs;                        // note-offs of bus notes still to come
+    };
+    std::vector<BusKey> busKeys_;
     std::vector<uint32_t> keyHeld_;
     std::vector<uint64_t> busOff_;
     uint64_t busPlanNs_ = 0, busRenderNs_ = 0;   // report only

@@ -766,6 +766,11 @@ public:
     // uses the per-event Dispatch/Render loop.
     virtual bool RenderEvents(const RealtimeEvent*, size_t, float*, float*,
                               uint32_t, uint64_t) { return false; }
+    // The release bus's lookahead (StandaloneSynth::EnableBusLookahead, SetBusLookahead): turns it on and says how
+    // far past a call it wants events (0: none); then those events, from the call's first frame, for the next
+    // RenderEvents call only.
+    virtual uint32_t EnableBusLookahead() { return 0u; }
+    virtual void SetBusLookahead(const RealtimeEvent*, size_t) {}
     // Cumulative whole-voice phase cycles {plan, jobs, post}; zeros if unknown.
     virtual void PhaseCycles(uint64_t (&out)[3]) const { out[0] = out[1] = out[2] = 0; }
     // {note-on collapse coalesced, re-excited, exact-merge folded}
@@ -830,9 +835,15 @@ public:
     void PostProcess(float* l, float* r, uint32_t n) { synth_.PostProcess(l, r, n); }
     bool RenderEvents(const RealtimeEvent* events, size_t count, float* left,
                       float* right, uint32_t frames, uint64_t frame) override {
+        synth_.SetBusLookahead(ahead_, aheadCount_);
         block_.Render(synth_, events, count, left, right, frames, frame);
+        synth_.SetBusLookahead(nullptr, 0);
+        ahead_ = nullptr;
+        aheadCount_ = 0;
         return true;
     }
+    uint32_t EnableBusLookahead() override { return synth_.EnableBusLookahead(); }
+    void SetBusLookahead(const RealtimeEvent* events, size_t count) override { ahead_ = events; aheadCount_ = count; }
     void PhaseCycles(uint64_t (&out)[3]) const override {
         out[0] = synth_.WvPlanCycles(); out[1] = synth_.WvJobCycles();
         out[2] = synth_.WvPostCycles();
@@ -859,6 +870,8 @@ public:
 private:
     StandaloneSynth synth_;
     RealtimeBlockRenderer block_;
+    const RealtimeEvent* ahead_ = nullptr;
+    size_t aheadCount_ = 0;
 };
 
 // Key-sharded render (the offline twin of the driver's synth.shards): note
@@ -898,6 +911,7 @@ public:
             if (!ok[i]) { error = errors[i]; return false; }
         for (auto& s : shards_) s->SetRawMix(true);
         mine_.resize(n);
+        ahead_s_.resize(n);
         filterNs_.assign(n, 0); renderNs_.assign(n, 0); keptEvents_.assign(n, 0);
         planeL_.resize(n); planeR_.resize(n);
         for (uint32_t i = 1; i < n; ++i) {
@@ -914,10 +928,18 @@ public:
         RenderEvents(nullptr, 0, left, right, frames, absoluteFrame);
     }
     void ReleaseAll() override { for (auto& s : shards_) s->ReleaseAll(); }
+    uint32_t EnableBusLookahead() override {
+        uint32_t frames = 0;
+        for (auto& s : shards_) frames = s->EnableBusLookahead();
+        return frames;
+    }
+    void SetBusLookahead(const RealtimeEvent* events, size_t count) override { ahead_ = events; aheadCount_ = count; }
     bool RenderEvents(const RealtimeEvent* events, size_t count, float* left,
                       float* right, uint32_t frames, uint64_t frame) override {
         if (!left) return true;  // capability probe
-        job_ = {events, count, frames, frame};
+        job_ = {events, count, frames, frame, ahead_, aheadCount_};
+        ahead_ = nullptr;
+        aheadCount_ = 0;
         outL_ = left; outR_ = right;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -965,7 +987,10 @@ public:
 #undef SVMS_SHARD_SUM
     const char* Backend() const override { return shards_[0]->Backend(); }
 private:
-    struct Job { const RealtimeEvent* events; size_t count; uint32_t frames; uint64_t frame; };
+    struct Job {
+        const RealtimeEvent* events; size_t count; uint32_t frames; uint64_t frame;
+        const RealtimeEvent* ahead; size_t aheadCount;
+    };
 
     static uint32_t ShardFor(uint32_t channel, uint32_t note, uint32_t n) {
         return (((channel * 128u + note) * 2654435761u) >> 16u) % n;
@@ -974,17 +999,20 @@ private:
         const uint32_t n = static_cast<uint32_t>(shards_.size());
         auto& mine = mine_[index];
         const auto t0 = std::chrono::steady_clock::now();
-        mine.clear();
-        for (size_t i = 0; i < job_.count; ++i) {
-            const RealtimeEvent& e = job_.events[i];
+        const auto ours = [&](const RealtimeEvent& e) {
             const uint8_t status = static_cast<uint8_t>(e.message);
             const uint8_t type = status & 0xf0u;
-            if (!e.reset && (type == 0x80u || type == 0x90u) &&
-                !IsInternalEngineMessage(e.message) &&
-                ShardFor(status & 0x0fu, (e.message >> 8u) & 0x7fu, n) != index)
-                continue;
-            mine.push_back(e);
-        }
+            return e.reset || (type != 0x80u && type != 0x90u) || IsInternalEngineMessage(e.message) ||
+                   ShardFor(status & 0x0fu, (e.message >> 8u) & 0x7fu, n) == index;
+        };
+        mine.clear();
+        for (size_t i = 0; i < job_.count; ++i)
+            if (ours(job_.events[i])) mine.push_back(job_.events[i]);
+        auto& ahead = ahead_s_[index];
+        ahead.clear();
+        for (size_t i = 0; i < job_.aheadCount; ++i)
+            if (ours(job_.ahead[i])) ahead.push_back(job_.ahead[i]);
+        if (job_.aheadCount) shards_[index]->SetBusLookahead(ahead.data(), ahead.size());
         float* l = index == 0 ? outL_ : planeL_[index].data();
         float* r = index == 0 ? outR_ : planeR_[index].data();
         const auto t1 = std::chrono::steady_clock::now();
@@ -1018,6 +1046,9 @@ private:
 
     std::vector<std::unique_ptr<LegacyOfflineSession>> shards_;
     std::vector<std::vector<RealtimeEvent>> mine_;
+    std::vector<std::vector<RealtimeEvent>> ahead_s_;   // each shard's part of the bus lookahead
+    const RealtimeEvent* ahead_ = nullptr;
+    size_t aheadCount_ = 0;
     std::vector<std::vector<float>> planeL_, planeR_;
     std::vector<uint64_t> filterNs_, renderNs_, keptEvents_;
     std::vector<std::thread> workers_;
@@ -1751,6 +1782,11 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
         };
         std::priority_queue<JitterEvent> jitterHeap;
         uint64_t jitterState = 88172645463325252ull;
+        // The release bus pairs notes up to this far past a block: events are read that far ahead and handed to
+        // it with each block (none with jitter, which reorders them).
+        const uint64_t lookahead = jitterFrames ? 0u : synth->EnableBusLookahead();
+        std::vector<RealtimeEvent> ahead, look;   // ahead: read, at or past the block's end, from aheadAt on
+        size_t aheadAt = 0;
         while (ioOk && !pollCancel() && frame < maxFrames) {
             uint32_t n = o.blockFrames;
             const uint64_t limit = frame + n;
@@ -1782,20 +1818,26 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
                 }
                 exhausted = jitterHeap.empty() && !ring.Peek(event) &&
                             done.load(std::memory_order_acquire);
-            } else for (;;) {
-                PackedMidiEvent next{};
-                while (!ring.Peek(next) &&
-                       !done.load(std::memory_order_acquire) && !pollCancel())
-                    std::this_thread::yield();
-                if (pollCancel()) break;
-                if (!ring.Peek(next)) { exhausted = true; break; }
-                if (next.outputFrame >= limit) break;
-                ring.Pop(event);
-                fullVel(event);
-                countSourceEvent(event);
-                ++events;
-                block.push_back({event.outputFrame, event.sequence,
-                                 event.message, false});
+            } else {
+                // Events read ahead for the release bus come first.
+                while (aheadAt < ahead.size() && ahead[aheadAt].targetFrame < limit)
+                    block.push_back(ahead[aheadAt++]);
+                for (;;) {
+                    PackedMidiEvent next{};
+                    while (!ring.Peek(next) &&
+                           !done.load(std::memory_order_acquire) && !pollCancel())
+                        std::this_thread::yield();
+                    if (pollCancel()) break;
+                    if (!ring.Peek(next)) { exhausted = aheadAt == ahead.size(); break; }
+                    if (next.outputFrame >= limit + lookahead) break;
+                    ring.Pop(event);
+                    fullVel(event);
+                    countSourceEvent(event);
+                    ++events;
+                    const RealtimeEvent e{event.outputFrame, event.sequence, event.message, false};
+                    if (e.targetFrame < limit && aheadAt == ahead.size()) block.push_back(e);
+                    else ahead.push_back(e);
+                }
             }
             if (pollCancel()) break;
             if (exhausted) {
@@ -1806,6 +1848,16 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
                     (std::min<uint64_t>)(n, info.totalFrames - frame));
                 while (!block.empty() && block.back().targetFrame >= frame + n)
                     block.pop_back();
+            }
+            if (lookahead != 0u) {
+                look.assign(block.begin(), block.end());
+                look.insert(look.end(), ahead.begin() + static_cast<std::ptrdiff_t>(aheadAt), ahead.end());
+                synth->SetBusLookahead(look.data(), look.size());
+                if (aheadAt == ahead.size()) { ahead.clear(); aheadAt = 0; }
+                else if (aheadAt > 4096u && 2u * aheadAt > ahead.size()) {
+                    ahead.erase(ahead.begin(), ahead.begin() + static_cast<std::ptrdiff_t>(aheadAt));
+                    aheadAt = 0;
+                }
             }
             const auto dspStart = std::chrono::steady_clock::now();
             synth->RenderEvents(block.data(), block.size(), left.data(),

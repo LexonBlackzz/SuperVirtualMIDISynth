@@ -235,7 +235,10 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
         add(0, 0xB0u | c | (10u << 8) | ((features & 16 ? 64u : rnd(128)) << 16));
     }
     for (uint32_t i = 0; i < 12000; ++i) {
-        const uint32_t c = rnd(8), key = 40 + rnd(50), vel = 1 + rnd(127), u = rnd(100);
+        // 64 (lookahead): keys at or below the root, where the one-shot outlives every note. Above it a voice can
+        // end before its note-off, and the voices then pair the key's next note-off with another note; the bus pairs
+        // note-offs in MIDI order.
+        const uint32_t c = rnd(8), key = 40 + rnd((features & 64) ? 21u : 50u), vel = 1 + rnd(127), u = rnd(100);
         const uint64_t on = 2000 + rnd(frames - 30000);
         const uint32_t len = u < 15 ? 0u : u < 60 ? rnd(240) : u < 85 ? 240 + rnd(800) : 2400 + rnd(19000);
         add(on, 0x90u | c | (key << 8) | (vel << 16));
@@ -283,6 +286,7 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
         if (!keep->Initialize(cfg, error)) { std::printf("FAIL  bus init: %s\n", error.c_str()); ++g_failures; return; }
         keep->SetRawMix(true);
         keep->SetReleaseBusSharing(share);
+        const uint32_t lookahead = (features & 64) ? keep->EnableBusLookahead() : 0u;
         RealtimeBlockRenderer blocks;
         l.assign(frames, 0.0f);
         r.assign(frames, 0.0f);
@@ -291,7 +295,13 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
             const uint32_t n = (std::min)(block, frames - f);
             size_t end = next;
             while (end < song.size() && song[end].targetFrame < f + n) ++end;
+            if (features & 64) {   // the offline renderer's lookahead
+                size_t ahead = end;
+                while (ahead < song.size() && song[ahead].targetFrame < f + n + lookahead) ++ahead;
+                keep->SetBusLookahead(song.data() + next, ahead - next);
+            }
             blocks.Render(*keep, song.data() + next, end - next, l.data() + f, r.data() + f, n, f);
+            keep->SetBusLookahead(nullptr, 0);
             next = end;
         }
     };
@@ -306,8 +316,8 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
                       "%zu histories at the end, %.1f MB of kernels)",
                       (unsigned long long)on->ReleaseBusNotes(), (unsigned long long)on->ReleaseBusHanded(),
                       on->ReleaseBusHistories(), on->ReleaseBusKernelBytes() / 1e6);
-        Check(on->ReleaseBusOn() && !off->ReleaseBusOn() && on->ReleaseBusNotes() > 3000 &&
-              on->ReleaseBusHanded() > 2000, what);
+        Check(on->ReleaseBusOn() && !off->ReleaseBusOn() && on->ReleaseBusNotes() > ((features & 64) ? 7000u : 3000u) &&
+              ((features & 64) || on->ReleaseBusHanded() > 2000), what);
         Check(off->Steals() == 0 && on->Steals() == 0, "nothing is stolen in either render");
         const double sL = SnrDb(offL, onL), sR = SnrDb(offR, onR);
         size_t first = 0;
@@ -366,6 +376,9 @@ int main() {
     RunBus(sf2, 48, "one mix, faded together");
     RunBus(sf2, 17, "one mix, then automation");
     RunBus(sf2, 63, "one mix, everything");
+    RunBus(sf2, 64, "lookahead");
+    RunBus(sf2, 79, "lookahead, everything");
+    RunBus(sf2, 127, "lookahead, one mix, everything");
     std::remove(path.c_str());
     std::printf(g_failures ? "%d FAILED\n" : "all passed\n", g_failures);
     return g_failures ? 1 : 0;

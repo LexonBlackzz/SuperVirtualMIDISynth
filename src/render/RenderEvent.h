@@ -61,6 +61,14 @@ inline constexpr uint32_t kMergedNoteOnMinCount = 2u;
 inline constexpr uint32_t kMergedNoteOnMaxCount =
     255u - kMergedNoteOnTypeBase + kMergedNoteOnMinCount;  // 241
 
+// An event as a host schedules it: packed MIDI at an absolute output frame.
+struct RealtimeEvent {
+    uint64_t targetFrame = 0u;   // absolute output frame
+    uint64_t sequence = 0u;      // ingress order (ties and note/control fences)
+    uint32_t message = 0u;       // packed MIDI (ignored for resets)
+    bool reset = false;
+};
+
 using EventDispatcher = void(*)(const RenderEvent& event, uint32_t blockCursor,
                                  void* userData);
 using EventBatchDispatcher = void(*)(const RenderEvent* events, uint32_t eventCount,

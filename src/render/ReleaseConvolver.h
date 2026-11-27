@@ -562,16 +562,16 @@ public:
     // whatever their age, with the outputs from block `next` - 1's frame `fromOffset` on. What a level has not
     // transformed yet moves in the input rings; what it has moves as products: into the pending output spectra,
     // the output chunk being played (its block `next` - 1 in fromPre / toPre, the processed block's sum) and the
-    // input's last chunk spectrum. The banks share block size and levels and are both at block `next`; the kernels
-    // have no level 0 and the inputs one kernel.
+    // input's last chunk spectrum. The banks share block size and levels and are both at block `next`, and the
+    // inputs one kernel.
     static void Move(ConvBank& from, int fromId, ConvBank* to, int toId, const std::pair<uint64_t, float>* imp,
                      size_t count, uint64_t next, uint32_t fromOffset, float* const fromPre[2], float* const toPre[2]) {
         const int B = from.block_;
         auto untransformed = [&](uint64_t frame) {
             const uint64_t bo = frame / static_cast<uint64_t>(B);
-            for (size_t lv = 1; lv < from.levels_.size(); ++lv) {
-                const uint64_t m = static_cast<uint64_t>(from.levels_[lv].m);
-                if ((bo / m + 2u) * m >= next) return true;
+            for (size_t lv = 0; lv < from.levels_.size(); ++lv) {
+                const uint64_t m = static_cast<uint64_t>(from.levels_[lv].m), lag = lv ? 2u : 0u;
+                if ((bo / m + lag) * m >= next) return true;
             }
             return false;
         };
@@ -582,14 +582,15 @@ public:
             }
         if (next == 0) return;
         const ConvKernel& k = *from.inputs_[static_cast<size_t>(fromId)].k;
-        for (size_t lv = 1; lv < from.levels_.size() && lv < k.levels.size(); ++lv) {
+        for (size_t lv = 0; lv < from.levels_.size() && lv < k.levels.size(); ++lv) {
             const ConvLevel& K = k.levels[lv];
+            const int64_t lag = lv ? 2 : 0;   // level 0 makes block b from X_b, the others chunk c from X_{c-2}
             if (K.parts == 0) continue;
             Level& LF = from.levels_[lv];
             Level* LT = to ? &to->levels_[lv] : nullptr;
             const int m = LF.m, n = m * B, size = LF.size;
             const int64_t cur = static_cast<int64_t>((next - 1) / static_cast<uint64_t>(m));   // output chunk playing
-            const int64_t jT = cur - 2;                                                         // last chunk transformed
+            const int64_t jT = cur - lag;                                                       // last chunk transformed
             int64_t jMin = INT64_MAX;
             for (size_t i = 0; i < count; ++i) {
                 const int64_t j = static_cast<int64_t>(imp[i].first / static_cast<uint64_t>(n));
@@ -623,7 +624,7 @@ public:
                 LF.fft->Run(z.data(), false);
                 for (int i = 0; i < size; ++i) zn[static_cast<size_t>(i)] = -z[static_cast<size_t>(i)];
                 for (int64_t p = 0; p < K.parts; ++p) {
-                    const int64_t t = j + 2 + p;
+                    const int64_t t = j + lag + p;
                     if (t < cur) continue;
                     const float* h = reinterpret_cast<const float*>(&K.h[static_cast<size_t>(p) * static_cast<size_t>(size)]);
                     if (t == cur) {
@@ -642,12 +643,14 @@ public:
                 const float scale = 1.0f / static_cast<float>(size);
                 const int off = static_cast<int>((next - 1) % static_cast<uint64_t>(m)) * B;
                 auto apply = [&](Level& L, float sign, float* const pre[2]) {
-                    float* oL = &L.out[static_cast<size_t>(cur & 1) * 2 * static_cast<size_t>(n)];
-                    float* oR = oL + n;
-                    if (!L.outLive[cur & 1]) { std::fill(oL, oR + n, 0.0f); L.outLive[cur & 1] = true; }
-                    for (int i = off + B; i < n; ++i) {
-                        oL[i] += sign * ycur[static_cast<size_t>(n + i)].real() * scale;
-                        oR[i] += sign * ycur[static_cast<size_t>(n + i)].imag() * scale;
+                    if (lv != 0) {   // level 0 outputs each block as it makes it: nothing ahead
+                        float* oL = &L.out[static_cast<size_t>(cur & 1) * 2 * static_cast<size_t>(n)];
+                        float* oR = oL + n;
+                        if (!L.outLive[cur & 1]) { std::fill(oL, oR + n, 0.0f); L.outLive[cur & 1] = true; }
+                        for (int i = off + B; i < n; ++i) {
+                            oL[i] += sign * ycur[static_cast<size_t>(n + i)].real() * scale;
+                            oR[i] += sign * ycur[static_cast<size_t>(n + i)].imag() * scale;
+                        }
                     }
                     for (int i = static_cast<int>(fromOffset); i < B; ++i) {
                         pre[0][i] += sign * ycur[static_cast<size_t>(n + off + i)].real() * scale;

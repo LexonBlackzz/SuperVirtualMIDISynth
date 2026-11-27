@@ -24,13 +24,6 @@
 
 namespace svms {
 
-struct RealtimeEvent {
-    uint64_t targetFrame = 0u;   // absolute output frame
-    uint64_t sequence = 0u;      // ingress order (ties and note/control fences)
-    uint32_t message = 0u;       // packed MIDI (ignored for resets)
-    bool reset = false;
-};
-
 class RealtimeBlockRenderer {
 public:
     // `events` must be sorted by (targetFrame, sequence) and hold only events

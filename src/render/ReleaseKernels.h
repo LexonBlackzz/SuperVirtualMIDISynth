@@ -127,7 +127,7 @@ struct ReleaseKernel {
     uint32_t heldFrames = 0;           // A covers tau < heldFrames (rendered directly by the bus)
     std::vector<float> heldL, heldR;   // A
     ConvKernel tail;                   // B(tau) = A(tau) * r^tau for tau < heldFrames + releaseFrames; with heldFrames
-                                       // of 8 blocks or more, level 0 (tau < 8 blocks) is left empty
+                                       // of 8 blocks or more, level 0 (tau < 8 blocks) is left empty (unless kept)
     float releaseDecay = 0.0f;
     size_t bytes = 0;
 };
@@ -144,8 +144,9 @@ inline const char* SetRefusal(const std::vector<KernelSource>& set) noexcept {
     return nullptr;
 }
 
+// keepLevel0: the bus convolves from tau = 0 and only corrects the held frames (a note known at its note-on).
 inline std::unique_ptr<ReleaseKernel> BuildKernel(const std::vector<KernelSource>& set, uint32_t heldFrames,
-                                                  int block, int maxLevels = 3) {
+                                                  int block, int maxLevels = 3, bool keepLevel0 = false) {
     const KernelSource& s = set[0];
     const uint32_t length = heldFrames + s.releaseFrames;
     std::vector<float> l(length, 0.0f), r(length, 0.0f), one(length), oneR(length);
@@ -164,7 +165,7 @@ inline std::unique_ptr<ReleaseKernel> BuildKernel(const std::vector<KernelSource
         p *= s.releaseDecay;
     }
     k->tail = MakeKernel(l.data(), r.data(), static_cast<int>(length), block, maxLevels);
-    if (heldFrames >= 8u * static_cast<uint32_t>(block) && !k->tail.levels.empty()) {
+    if (!keepLevel0 && heldFrames >= 8u * static_cast<uint32_t>(block) && !k->tail.levels.empty()) {
         // The bus renders tau < heldFrames directly from A; level 0 (the first 8 blocks) is not convolved.
         k->tail.levels[0].parts = 0;
         std::vector<Cf>().swap(k->tail.levels[0].h);
@@ -194,8 +195,9 @@ public:
     // background: build on the store's own thread (Get returns nullptr until the kernel is ready). Without it Get
     // builds a new kernel on the spot, so offline renders do not depend on thread timing.
     void Start(SourceFn source, uint32_t heldFrames, int block, size_t budgetBytes, int maxLevels = 3,
-               bool background = true) {
+               bool background = true, bool keepLevel0 = false) {
         Stop();
+        keepLevel0_ = keepLevel0;
         background_ = background;
         source_ = std::move(source);
         heldFrames_ = heldFrames;
@@ -300,7 +302,7 @@ private:
         std::vector<KernelSource> src;
         const uint64_t key = s.key.load(std::memory_order_relaxed) - 1u;
         if (!source_(key, src) || SetRefusal(src)) return Refuse(s);
-        std::unique_ptr<ReleaseKernel> k = BuildKernel(src, heldFrames_, block_, maxLevels_);
+        std::unique_ptr<ReleaseKernel> k = BuildKernel(src, heldFrames_, block_, maxLevels_, keepLevel0_);
         if (bytes_.load(std::memory_order_relaxed) + k->bytes > budget_) return Refuse(s);
         for (ConvLevel& L : k->tail.levels) L.fft = SharedFft(L.fft);   // one twiddle table per size
         bytes_.fetch_add(k->bytes, std::memory_order_relaxed);
@@ -321,6 +323,7 @@ private:
 
     SourceFn source_;
     uint32_t heldFrames_ = 0;
+    bool keepLevel0_ = false;
     int block_ = 1024, maxLevels_ = 3;
     size_t budget_ = 0;
     std::unique_ptr<Slot[]> slots_;

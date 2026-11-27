@@ -189,13 +189,15 @@ bool LateImpulses() {
 // Moved impulses: a bus kernel (no level 0), impulses on time into bank A; after block `at` - 1 the impulses
 // marked moved go from A to B (null: dropped) from that block's frame `offset` on, and the later ones straight to
 // B. A then sounds the kept impulses, and the moved ones only before the move; B the moved ones only after it.
-bool MovedImpulses(int at, int offset, bool drop, unsigned seed) {
+bool MovedImpulses(int at, int offset, bool drop, unsigned seed, bool level0 = false) {
     const int block = 64, blocks = 300, frames = block * blocks, length = 64 * 45 + 17;
     Kernel kern = RandomKernel(length, seed);
     ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, 3);
-    k.levels[0].parts = 0;
-    k.levels[0].h.clear();
-    for (int t = 0; t < 8 * block; ++t) kern.l[static_cast<size_t>(t)] = kern.r[static_cast<size_t>(t)] = 0.0f;
+    if (!level0) {   // the bus kernels without a lookahead
+        k.levels[0].parts = 0;
+        k.levels[0].h.clear();
+        for (int t = 0; t < 8 * block; ++t) kern.l[static_cast<size_t>(t)] = kern.r[static_cast<size_t>(t)] = 0.0f;
+    }
     std::mt19937 rng(seed + 1);
     std::uniform_int_distribution<int> when(0, frames - 1), coin(0, 1);
     std::uniform_real_distribution<float> weight(-1.0f, 1.0f);
@@ -250,7 +252,7 @@ bool MovedImpulses(int at, int offset, bool drop, unsigned seed) {
     errB /= (std::max)(peak, 1e-30);
     const bool ok = errA < 2e-6 && errB < 2e-6;
     std::printf("%s moved impulses (after block %d, frame %d of it%s): error %.2e / %.2e of peak\n", ok ? "PASS" : "FAIL",
-                at - 1, offset, drop ? ", dropped" : "", errA, errB);
+                at - 1, offset, drop ? (level0 ? ", dropped, level 0" : ", dropped") : (level0 ? ", level 0" : ""), errA, errB);
     return ok;
 }
 
@@ -369,6 +371,9 @@ int main(int argc, char** argv) {
     ok &= MovedImpulses(211, 30, false, 74);
     ok &= MovedImpulses(100, 12, true, 75);
     ok &= MovedImpulses(144, 0, true, 76);
+    ok &= MovedImpulses(41, 9, false, 77, true);
+    ok &= MovedImpulses(128, 0, false, 78, true);
+    ok &= MovedImpulses(201, 50, true, 79, true);
     ok &= AvxMatchesScalar();
     ok &= EvenWork();
     std::printf(ok ? "all release convolver tests passed\n" : "release convolver tests FAILED\n");
