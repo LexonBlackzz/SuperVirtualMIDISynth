@@ -84,17 +84,33 @@ public:
     // A same-block note: on at `on` (an open frame), held `held` frames (within on's block).
     void AddNote(uint64_t kernelKey, const ReleaseKernel* k, uint8_t channel, uint64_t on, uint32_t held, float v) {
         if (on < processedEnd_) return;   // the synth checked Open; belt and braces
-        AddImpulse(kernelKey, k, channel, on, held, v);
-        AddDirect(k, channel, on, held, v, on);
+        const float w = Weight(k, held, v);
+        AddImpulse(kernelKey, k, channel, on, w);
+        AddDirect(k, channel, on, held, v, w, on);
         ++notes_;
     }
 
     // The convolved part of a note (tau >= D): w at `on`. The synth checked Open or Insertable.
     void AddImpulse(uint64_t kernelKey, const ReleaseKernel* k, uint8_t channel, uint64_t on, uint32_t held, float v) {
+        AddImpulse(kernelKey, k, channel, on, Weight(k, held, v));
+    }
+
+    // The direct part of a note, frames [from, on + D): v * A(tau) while held, v * A(tau) * r^(tau - held + 1)
+    // after. `from` must not be output yet.
+    void AddDirect(const ReleaseKernel* k, uint8_t channel, uint64_t on, uint32_t held, float v, uint64_t from) {
+        AddDirect(k, channel, on, held, v, level0_ ? Weight(k, held, v) : 0.0f, from);
+    }
+
+    // The convolution's weight for a note: v * r^(1 - held).
+    static float Weight(const ReleaseKernel* k, uint32_t held, float v) noexcept {
+        return static_cast<float>(v * std::pow(static_cast<double>(k->releaseDecay), 1.0 - static_cast<double>(held)));
+    }
+
+private:
+    void AddImpulse(uint64_t kernelKey, const ReleaseKernel* k, uint8_t channel, uint64_t on, float w) {
         Chan& h = chan_[channel & 15u];
         Group& g = Route(h, on + static_cast<uint64_t>(k->tail.length) + block_);
         In& in = InputOf(g, kernelKey, k);
-        const float w = static_cast<float>(v * std::pow(static_cast<double>(k->releaseDecay), 1.0 - static_cast<double>(held)));
         g.bank.AddImpulse(in.id, on, w, processedEnd_ / block_);
         in.lastInput = (std::max)(in.lastInput, on);
         g.active = true;
@@ -105,18 +121,16 @@ public:
         if (hs.imps.size() >= 2u * hs.keep) { Prune(hs); hs.keep = (std::max)(size_t(64), hs.imps.size()); }
     }
 
-    // The direct part of a note, frames [from, on + D): v * A(tau) while held, v * A(tau) * r^(tau - held + 1)
-    // after. `from` must not be output yet.
-    void AddDirect(const ReleaseKernel* k, uint8_t channel, uint64_t on, uint32_t held, float v, uint64_t from) {
+    void AddDirect(const ReleaseKernel* k, uint8_t channel, uint64_t on, uint32_t held, float v, float w, uint64_t from) {
         const uint64_t end = DirectEnd(k, on, held);
         const uint64_t open = processedEnd_ - (processedEnd_ ? block_ : 0u);   // start of the processed block
         if (from < open) from = open;   // already output: cannot change
         if (from >= end) return;
         Chan& h = chan_[channel & 15u];
         Group& g = Route(h, end + block_);
-        DirectInto(g, k, on, held, v, from, 1.0f);
+        DirectInto(g, k, on, held, v, w, from, 1.0f);
         if (!share_) return;
-        h.dirs.push_back({k, on, from, held, v});
+        h.dirs.push_back({k, on, from, held, v, w});
         if (h.dirs.size() >= 2u * h.dirsKeep) {
             h.dirs.erase(std::remove_if(h.dirs.begin(), h.dirs.end(),
                                         [&](const Dir& d) { return DirectEnd(d.k, d.on, d.held) <= outFrom_; }),
@@ -125,6 +139,7 @@ public:
         }
     }
 
+public:
     // The channel's mix gains from `frame` on (a voice's mixScaleLeft / mixScaleRight).
     void SetMix(uint8_t channel, uint64_t frame, float left, float right) {
         Chan& h = chan_[channel & 15u];
@@ -227,6 +242,7 @@ private:
         std::vector<float> dir[2];   // direct sound of later frames, frame f at f % ring
         ConvBank bank;
         std::unordered_map<uint64_t, In> inputs;   // kernel key -> bank input
+        std::vector<In*> fast;                      // the same, by kernel busIndex (null: none)
         std::vector<Change> changes;
         size_t next = 0;
         float mixL = 0.0f, mixR = 0.0f;   // the gains being applied
@@ -238,7 +254,7 @@ private:
     };
     // A channel's sound in its group, kept while sharing so it can move: impulses per kernel, direct parts.
     struct Hist { const ReleaseKernel* k = nullptr; std::vector<std::pair<uint64_t, float>> imps; size_t keep = 64; };
-    struct Dir { const ReleaseKernel* k; uint64_t on, from; uint32_t held; float v; };
+    struct Dir { const ReleaseKernel* k; uint64_t on, from; uint32_t held; float v, w; };
     struct Chan {
         float L = 0.0f, R = 0.0f, prevL = 0.0f, prevR = 0.0f;   // as Group's
         uint64_t changed = 0;
@@ -259,9 +275,15 @@ private:
         g->bank.Prepare(static_cast<int>(block_));
         groups_.push_back(std::move(g));
     }
+    // A kernel key names one kernel (the store's), so the kernel's dense index finds the input without the map.
     In& InputOf(Group& g, uint64_t kernelKey, const ReleaseKernel* k) {
+        if (k->busIndex < 0) k->busIndex = nextIndex_++;
+        const size_t i = static_cast<size_t>(k->busIndex);
+        if (i < g.fast.size() && g.fast[i]) return *g.fast[i];
         auto it = g.inputs.find(kernelKey);
         if (it == g.inputs.end()) it = g.inputs.emplace(kernelKey, In{k, g.bank.Add(k->tail), 0u}).first;
+        if (g.fast.size() <= i) g.fast.resize(i + 1, nullptr);
+        g.fast[i] = &it->second;
         return it->second;
     }
     // With level 0 the convolution covers every frame and the direct part only corrects the held ones.
@@ -390,8 +412,8 @@ private:
         }
         for (const Dir& d : h.dirs) {
             const uint64_t f = (std::max)(d.from, from);
-            DirectInto(g, d.k, d.on, d.held, d.v, f, -1.0f);
-            if (to) DirectInto(*to, d.k, d.on, d.held, d.v, f, 1.0f);
+            DirectInto(g, d.k, d.on, d.held, d.v, d.w, f, -1.0f);
+            if (to) DirectInto(*to, d.k, d.on, d.held, d.v, d.w, f, 1.0f);
         }
         g.preLive = true;
         if (to) {
@@ -407,20 +429,48 @@ private:
     }
 
     // Frames [from, end of the note's direct span) of a note's direct part, times `sign`.
-    void DirectInto(Group& g, const ReleaseKernel* k, uint64_t on, uint32_t held, float v, uint64_t from, float sign) {
+    // With level 0, `w` is the note's convolution weight.
+    void DirectInto(Group& g, const ReleaseKernel* k, uint64_t on, uint32_t held, float v, float w, uint64_t from,
+                    float sign) {
         const uint64_t end = DirectEnd(k, on, held);
         const uint64_t open = processedEnd_ - (processedEnd_ ? block_ : 0u);
         if (from < open) from = open;
         if (from >= end) return;
+        if (level0_) {
+            // While held the convolution gives w B where the note is v A: add v A - w B, with the B it convolves.
+            const float sv = sign * v, sw = sign * w;
+            const auto span = [&](float* outL, float* outR, uint64_t f0, uint64_t f1) {
+                const size_t t0 = static_cast<size_t>(f0 - on), n = static_cast<size_t>(f1 - f0);
+                const float* aL = k->heldL.data() + t0;
+                const float* aR = k->heldR.data() + t0;
+                const float* bL = k->heldBL.data() + t0;
+                const float* bR = k->heldBR.data() + t0;
+                for (size_t i = 0; i < n; ++i) {
+                    outL[i] += sv * aL[i] - sw * bL[i];
+                    outR[i] += sv * aR[i] - sw * bR[i];
+                }
+            };
+            const uint64_t mid = (std::min)((std::max)(from, processedEnd_), end);
+            if (from < mid) {
+                span(g.pre[0].data() + (from - open), g.pre[1].data() + (from - open), from, mid);
+                g.preLive = true;
+            }
+            if (mid < end) {   // the ring, wrapping at most once (a direct span is shorter than it)
+                const uint64_t slot = mid % ring_, wrap = (std::min)(end, mid + (ring_ - slot));
+                span(g.dir[0].data() + slot, g.dir[1].data() + slot, mid, wrap);
+                if (wrap < end) span(g.dir[0].data(), g.dir[1].data(), wrap, end);
+            }
+            g.active = true;
+            return;
+        }
         const double r = k->releaseDecay;
         uint32_t t = static_cast<uint32_t>(from - on);
-        // r^(tau - held + 1) at the first released frame on or after `from`; with level 0, at `from` itself.
-        double p = std::pow(r, static_cast<double>(level0_ ? t : (std::max)(t, held)) - static_cast<double>(held) + 1.0);
+        // r^(tau - held + 1) at the first released frame on or after `from`.
+        double p = std::pow(r, static_cast<double>((std::max)(t, held)) - static_cast<double>(held) + 1.0);
         uint32_t slot = static_cast<uint32_t>(from % ring_);
         for (uint64_t f = from; f < end; ++f, ++t, slot = slot + 1u == ring_ ? 0u : slot + 1u) {
-            // Level 0: while held the convolution gives w B = v A r^(tau - held + 1) where the note is v A.
-            const float gain = static_cast<float>(level0_ ? v * (1.0 - p) : t < held ? v : v * p) * sign;
-            if (level0_ || t >= held) p *= r;
+            const float gain = static_cast<float>(t < held ? v : v * p) * sign;
+            if (t >= held) p *= r;
             const float l = k->heldL[t] * gain, rr = k->heldR[t] * gain;
             if (f < processedEnd_) {
                 g.pre[0][static_cast<size_t>(f - open)] += l;
@@ -438,6 +488,7 @@ private:
         Group& g = *groups_[size_t(gi)];
         g.bank.RemoveAll();
         g.inputs.clear();
+        g.fast.clear();
         for (int s = 0; s < 2; ++s) std::fill(g.dir[s].begin(), g.dir[s].end(), 0.0f);
         g.cutAt = UINT64_MAX;
         g.until = soundUntil;   // the processed block's frames before a cut still play
@@ -482,6 +533,7 @@ private:
                     const In& in = it->second;
                     if (blockStart + block_ >= in.lastInput + static_cast<uint64_t>(in.kernel->tail.length) + block_) {
                         g.bank.Remove(in.id);
+                        g.fast[size_t(in.kernel->busIndex)] = nullptr;
                         it = g.inputs.erase(it);
                     } else {
                         ++it;
@@ -515,6 +567,7 @@ private:
     uint32_t lanes_ = 1;
     std::vector<std::unique_ptr<Group>> groups_;
     Chan chan_[kChannels];
+    int nextIndex_ = 0;   // the next kernel busIndex
     uint64_t notes_ = 0, blocks_ = 0, convolved_ = 0, busNs_ = 0, moves_ = 0;
 };
 

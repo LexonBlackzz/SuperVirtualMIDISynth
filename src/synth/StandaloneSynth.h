@@ -1573,7 +1573,8 @@ private:
         // With level 0 the convolution gives the held frames v A r^(tau - held + 1) and the correction takes it back:
         // a gain of r^(1 - held) on the convolution's rounding. Above 40 dB (a long note with a short release) the
         // note stays a voice.
-        if (busAheadOn_ && (double(off - on) - 1.0) * -std::log(double(kernel->releaseDecay)) > std::log(100.0))
+        static const double kLog100 = std::log(100.0);
+        if (busAheadOn_ && (double(off - on) - 1.0) * kernel->negLogDecay > kLog100)
             return false;
         bus_.AddNote(kernelKey, kernel, channel, on, uint32_t(off - on), v);
         channels_.NoteOn(channel, note, velocity);

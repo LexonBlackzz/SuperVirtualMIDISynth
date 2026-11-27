@@ -126,9 +126,13 @@ inline void RenderHeld(const KernelSource& s, uint32_t frames, float* left, floa
 struct ReleaseKernel {
     uint32_t heldFrames = 0;           // A covers tau < heldFrames (rendered directly by the bus)
     std::vector<float> heldL, heldR;   // A
+    std::vector<float> heldBL, heldBR; // B over the same frames, with level 0 kept (its correction cancels the
+                                       // convolution with it)
     ConvKernel tail;                   // B(tau) = A(tau) * r^tau for tau < heldFrames + releaseFrames; with heldFrames
                                        // of 8 blocks or more, level 0 (tau < 8 blocks) is left empty (unless kept)
     float releaseDecay = 0.0f;
+    double negLogDecay = 0.0;          // -log r
+    mutable int busIndex = -1;         // the release bus's dense index for it (ReleaseBus::InputOf), set there
     size_t bytes = 0;
 };
 
@@ -164,6 +168,10 @@ inline std::unique_ptr<ReleaseKernel> BuildKernel(const std::vector<KernelSource
         r[t] = static_cast<float>(r[t] * p);
         p *= s.releaseDecay;
     }
+    if (keepLevel0) {
+        k->heldBL.assign(l.begin(), l.begin() + heldFrames);
+        k->heldBR.assign(r.begin(), r.begin() + heldFrames);
+    }
     k->tail = MakeKernel(l.data(), r.data(), static_cast<int>(length), block, maxLevels);
     if (!keepLevel0 && heldFrames >= 8u * static_cast<uint32_t>(block) && !k->tail.levels.empty()) {
         // The bus renders tau < heldFrames directly from A; level 0 (the first 8 blocks) is not convolved.
@@ -171,7 +179,8 @@ inline std::unique_ptr<ReleaseKernel> BuildKernel(const std::vector<KernelSource
         std::vector<Cf>().swap(k->tail.levels[0].h);
     }
     k->releaseDecay = s.releaseDecay;
-    k->bytes = 2u * heldFrames * sizeof(float);
+    k->negLogDecay = -std::log(static_cast<double>(s.releaseDecay));
+    k->bytes = (2u * heldFrames + k->heldBL.size() + k->heldBR.size()) * sizeof(float);
     for (const ConvLevel& L : k->tail.levels) k->bytes += L.h.size() * sizeof(Cf);
     return k;
 }
