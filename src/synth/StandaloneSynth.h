@@ -381,6 +381,11 @@ public:
     bool ReleaseBusOn() const { return busOn_; }
     uint64_t ReleaseBusNotes() const { return busNotes_; }
     uint64_t ReleaseBusHanded() const { return busHanded_; }
+    uint64_t ReleaseBusMoves() const { return bus_.Moves(); }
+    double ReleaseBusConvolutionsPerBlock() const {
+        return bus_.Blocks() ? double(bus_.Convolved()) / double(bus_.Blocks()) : 0.0;
+    }
+    void SetReleaseBusSharing(bool on) { bus_.SetSharing(on); }
     size_t ReleaseBusHistories() const { return bus_.Histories(); }
     size_t ReleaseBusKernelBytes() const { return busKernels_.Bytes(); }
     double BusMsPerSecond(uint64_t ns) const {
@@ -394,12 +399,12 @@ public:
         if (busOn_)
             std::fprintf(stderr, "[SVMS] release bus: %llu same-block and %llu handed-off notes of %llu, %.1f MB of "
                          "kernels, %u regions refused, "
-                         "%.0f convolutions per block; ms per audio second: %.0f convolving, %.0f mixing, "
+                         "%.0f convolutions per block, %llu mix moves; ms per audio second: %.0f convolving, %.0f mixing, "
                          "%.0f planning, %.0f building kernels\n",
                          (unsigned long long)busNotes_, (unsigned long long)busHanded_,
                          (unsigned long long)noteCalls_,
                          busKernels_.Bytes() / 1e6, busKernels_.Refused(),
-                         bus_.Blocks() ? double(bus_.Convolved()) / double(bus_.Blocks()) : 0.0,
+                         bus_.Blocks() ? double(bus_.Convolved()) / double(bus_.Blocks()) : 0.0, (unsigned long long)bus_.Moves(),
                          BusMsPerSecond(bus_.BusNs()), BusMsPerSecond(busRenderNs_ - bus_.BusNs()),
                          BusMsPerSecond(busPlanNs_), BusMsPerSecond(busKernels_.BuildNs()));
         // Opt-in end-of-session diagnostic: every plan refusal is a skipped
@@ -1292,6 +1297,7 @@ private:
 
     void StartBus() {
         bus_.Configure(busBlock_);
+        bus_.SetSharing(std::getenv("SVMS_BUS_NO_SHARE") == nullptr);   // A/B runs: one group per channel
         keyHeld_.assign(size_t(kChannelCount) * kNoteCount, 0u);
         busOff_.assign(size_t(kChannelCount) * kNoteCount, UINT64_MAX);
         busPend_.assign(size_t(kChannelCount) * kNoteCount, BusPend{});

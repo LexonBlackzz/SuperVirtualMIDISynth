@@ -186,6 +186,74 @@ bool LateImpulses() {
     return ok;
 }
 
+// Moved impulses: a bus kernel (no level 0), impulses on time into bank A; after block `at` - 1 the impulses
+// marked moved go from A to B (null: dropped) from that block's frame `offset` on, and the later ones straight to
+// B. A then sounds the kept impulses, and the moved ones only before the move; B the moved ones only after it.
+bool MovedImpulses(int at, int offset, bool drop, unsigned seed) {
+    const int block = 64, blocks = 300, frames = block * blocks, length = 64 * 45 + 17;
+    Kernel kern = RandomKernel(length, seed);
+    ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, 3);
+    k.levels[0].parts = 0;
+    k.levels[0].h.clear();
+    for (int t = 0; t < 8 * block; ++t) kern.l[static_cast<size_t>(t)] = kern.r[static_cast<size_t>(t)] = 0.0f;
+    std::mt19937 rng(seed + 1);
+    std::uniform_int_distribution<int> when(0, frames - 1), coin(0, 1);
+    std::uniform_real_distribution<float> weight(-1.0f, 1.0f);
+    struct Imp { int frame; float w; bool moved; };
+    std::vector<Imp> imps;
+    std::vector<float> kept(static_cast<size_t>(frames), 0.0f), moved(kept);
+    for (int i = 0; i < 300; ++i) {
+        imps.push_back({when(rng), weight(rng), coin(rng) == 1});
+        (imps.back().moved ? moved : kept)[static_cast<size_t>(imps.back().frame)] += imps.back().w;
+    }
+    svms::bus::ConvBank a, b;
+    a.Prepare(block, 3);
+    b.Prepare(block, 3);
+    const int ia = a.Add(k), ib = b.Add(k);
+    std::vector<float> outA(static_cast<size_t>(2 * frames), 0.0f), outB(outA);
+    const int moveFrame = (at - 1) * block + offset;
+    for (int bl = 0; bl < blocks; ++bl) {
+        if (bl == at) {
+            std::vector<std::pair<uint64_t, float>> list;
+            for (const Imp& m : imps)
+                if (m.moved && m.frame < at * block) list.emplace_back(static_cast<uint64_t>(m.frame), m.w);
+            float* const preA[2] = {&outA[static_cast<size_t>((at - 1) * block)], &outA[static_cast<size_t>(frames + (at - 1) * block)]};
+            float* const preB[2] = {&outB[static_cast<size_t>((at - 1) * block)], &outB[static_cast<size_t>(frames + (at - 1) * block)]};
+            svms::bus::ConvBank::Move(a, ia, drop ? nullptr : &b, ib, list.data(), list.size(), static_cast<uint64_t>(at),
+                                      static_cast<uint32_t>(offset), preA, preB);
+        }
+        for (const Imp& m : imps)
+            if (m.frame / block == bl) {
+                const bool toB = m.moved && bl >= at;
+                if (toB && drop) continue;
+                (toB ? b : a).AddImpulse(toB ? ib : ia, static_cast<uint64_t>(m.frame), m.w, static_cast<uint64_t>(bl));
+            }
+        a.Process(&outA[static_cast<size_t>(bl * block)], &outA[static_cast<size_t>(frames + bl * block)], static_cast<uint64_t>(bl));
+        b.Process(&outB[static_cast<size_t>(bl * block)], &outB[static_cast<size_t>(frames + bl * block)], static_cast<uint64_t>(bl));
+    }
+    // The references in double: A = kept + moved before the move, B = moved after it (or nothing, dropped).
+    double peak = 0.0, errA = 0.0, errB = 0.0;
+    for (int side = 0; side < 2; ++side)
+        for (int t = 0; t < frames; ++t) {
+            const std::vector<float>& h = side ? kern.r : kern.l;
+            double yk = 0.0, ym = 0.0;
+            for (int tau = 0; tau < length && tau <= t; ++tau) {
+                yk += double(h[static_cast<size_t>(tau)]) * kept[static_cast<size_t>(t - tau)];
+                ym += double(h[static_cast<size_t>(tau)]) * moved[static_cast<size_t>(t - tau)];
+            }
+            const double wantA = yk + (t < moveFrame ? ym : 0.0), wantB = t < moveFrame || drop ? 0.0 : ym;
+            peak = std::fmax(peak, std::fabs(yk + ym));
+            errA = std::fmax(errA, std::fabs(wantA - outA[static_cast<size_t>(side * frames + t)]));
+            errB = std::fmax(errB, std::fabs(wantB - outB[static_cast<size_t>(side * frames + t)]));
+        }
+    errA /= (std::max)(peak, 1e-30);
+    errB /= (std::max)(peak, 1e-30);
+    const bool ok = errA < 2e-6 && errB < 2e-6;
+    std::printf("%s moved impulses (after block %d, frame %d of it%s): error %.2e / %.2e of peak\n", ok ? "PASS" : "FAIL",
+                at - 1, offset, drop ? ", dropped" : "", errA, errB);
+    return ok;
+}
+
 // The AVX products and butterflies give the scalar loops' bits (renders do not depend on the CPU).
 bool AvxMatchesScalar() {
     if (!svms::bus::BusAvx()) { std::printf("SKIP avx equals scalar: no AVX\n"); return true; }
@@ -294,6 +362,13 @@ int main(int argc, char** argv) {
     ok &= ZeroLatency();
     ok &= BankMatchesDirect();
     ok &= LateImpulses();
+    ok &= MovedImpulses(9, 0, false, 70);
+    ok &= MovedImpulses(40, 17, false, 71);
+    ok &= MovedImpulses(77, 63, false, 72);
+    ok &= MovedImpulses(129, 5, false, 73);
+    ok &= MovedImpulses(211, 30, false, 74);
+    ok &= MovedImpulses(100, 12, true, 75);
+    ok &= MovedImpulses(144, 0, true, 76);
     ok &= AvxMatchesScalar();
     ok &= EvenWork();
     std::printf(ok ? "all release convolver tests passed\n" : "release convolver tests FAILED\n");

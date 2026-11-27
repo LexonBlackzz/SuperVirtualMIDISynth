@@ -230,8 +230,9 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
     uint32_t lcg = 777u;
     auto rnd = [&](uint32_t n) { lcg = lcg * 1664525u + 1013904223u; return (lcg >> 8) % n; };
     for (uint32_t c = 0; c < 8; ++c) {
-        add(0, 0xB0u | c | (7u << 8) | ((60u + rnd(60)) << 16));
-        add(0, 0xB0u | c | (10u << 8) | (rnd(128) << 16));
+        // 16: one mix for every channel, so they share one bus group
+        add(0, 0xB0u | c | (7u << 8) | ((features & 16 ? 100u : 60u + rnd(60)) << 16));
+        add(0, 0xB0u | c | (10u << 8) | ((features & 16 ? 64u : rnd(128)) << 16));
     }
     for (uint32_t i = 0; i < 12000; ++i) {
         const uint32_t c = rnd(8), key = 40 + rnd(50), vel = 1 + rnd(127), u = rnd(100);
@@ -258,11 +259,16 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
     if (features & 8) {
     add(200000, 0xB0u | 7u | (120u << 8));                                // channel 7 all sound off
     }
+    if (features & 32)
+    for (uint64_t f = 30000; f < frames - 2000; f += 20000 + rnd(9000)) {   // every channel fades together
+        const uint32_t v = 40u + rnd(88);
+        for (uint32_t c = 0; c < 8; ++c) add(f, 0xB0u | c | (7u << 8) | (v << 16));
+    }
     std::stable_sort(song.begin(), song.end(), [](const RealtimeEvent& a, const RealtimeEvent& b) {
         return a.targetFrame != b.targetFrame ? a.targetFrame < b.targetFrame : a.sequence < b.sequence;
     });
 
-    auto render = [&](bool busOn, std::vector<float>& l, std::vector<float>& r, StandaloneSynth*& keep) {
+    auto render = [&](bool busOn, bool share, std::vector<float>& l, std::vector<float>& r, StandaloneSynth*& keep) {
         StandaloneSynthConfig cfg;
         cfg.soundfont = sf2;
         cfg.sampleRate = 48000;
@@ -276,6 +282,7 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
         std::string error;
         if (!keep->Initialize(cfg, error)) { std::printf("FAIL  bus init: %s\n", error.c_str()); ++g_failures; return; }
         keep->SetRawMix(true);
+        keep->SetReleaseBusSharing(share);
         RealtimeBlockRenderer blocks;
         l.assign(frames, 0.0f);
         r.assign(frames, 0.0f);
@@ -291,8 +298,8 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
     std::vector<float> offL, offR, onL, onR;
     StandaloneSynth* off = nullptr;
     StandaloneSynth* on = nullptr;
-    render(false, offL, offR, off);
-    render(true, onL, onR, on);
+    render(false, true, offL, offR, off);
+    render(true, true, onL, onR, on);
     if (off && on) {
         char what[200];
         std::snprintf(what, sizeof what, "the bus is on and takes notes (%llu same-block and %llu handed off of 12000, "
@@ -307,6 +314,22 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
         while (first < offL.size() && std::fabs(offL[first] - onL[first]) < 1e-5f) ++first;
         std::snprintf(what, sizeof what, "%s: bus on equals bus off (%.1f / %.1f dB, first difference at frame %zu)", name, sL, sR, first);
         Check(sL >= 60.0 && sR >= 60.0, what);
+        if (features & 16) {
+            std::vector<float> soloL, soloR;
+            StandaloneSynth* solo = nullptr;
+            render(true, false, soloL, soloR, solo);
+            if (solo) {
+                const double shared = on->ReleaseBusConvolutionsPerBlock(), alone = solo->ReleaseBusConvolutionsPerBlock();
+                std::snprintf(what, sizeof what, "%s: channels of one mix share convolutions (%.0f per block, %.0f "
+                              "with a group per channel; %llu mix moves)", name, shared, alone,
+                              (unsigned long long)on->ReleaseBusMoves());
+                Check(shared < ((features & 1) ? 0.8 : 0.5) * alone && ((features & 1) || on->ReleaseBusMoves() == 0), what);
+                const double gL = SnrDb(soloL, onL), gR = SnrDb(soloR, onR);
+                std::snprintf(what, sizeof what, "%s: shared groups equal a group per channel (%.1f / %.1f dB)", name, gL, gR);
+                Check(gL >= 100.0 && gR >= 100.0, what);
+            }
+            delete solo;
+        }
     }
     delete off;
     delete on;
@@ -339,6 +362,10 @@ int main() {
     RunBus(sf2, 4, "sustain pedal");
     RunBus(sf2, 8, "all sound off");
     RunBus(sf2, 15, "everything");
+    RunBus(sf2, 16, "one mix");
+    RunBus(sf2, 48, "one mix, faded together");
+    RunBus(sf2, 17, "one mix, then automation");
+    RunBus(sf2, 63, "one mix, everything");
     std::remove(path.c_str());
     std::printf(g_failures ? "%d FAILED\n" : "all passed\n", g_failures);
     return g_failures ? 1 : 0;

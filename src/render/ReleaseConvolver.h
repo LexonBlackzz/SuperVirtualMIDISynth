@@ -558,6 +558,119 @@ public:
         in.loud[static_cast<size_t>((frame / static_cast<uint64_t>(block_)) % static_cast<uint64_t>(ring_ / block_))] = 1u;
     }
 
+    // Moves impulses (frame, weight) of input `fromId` in `from` to input `toId` in `to` (null: drops them),
+    // whatever their age, with the outputs from block `next` - 1's frame `fromOffset` on. What a level has not
+    // transformed yet moves in the input rings; what it has moves as products: into the pending output spectra,
+    // the output chunk being played (its block `next` - 1 in fromPre / toPre, the processed block's sum) and the
+    // input's last chunk spectrum. The banks share block size and levels and are both at block `next`; the kernels
+    // have no level 0 and the inputs one kernel.
+    static void Move(ConvBank& from, int fromId, ConvBank* to, int toId, const std::pair<uint64_t, float>* imp,
+                     size_t count, uint64_t next, uint32_t fromOffset, float* const fromPre[2], float* const toPre[2]) {
+        const int B = from.block_;
+        auto untransformed = [&](uint64_t frame) {
+            const uint64_t bo = frame / static_cast<uint64_t>(B);
+            for (size_t lv = 1; lv < from.levels_.size(); ++lv) {
+                const uint64_t m = static_cast<uint64_t>(from.levels_[lv].m);
+                if ((bo / m + 2u) * m >= next) return true;
+            }
+            return false;
+        };
+        for (size_t i = 0; i < count; ++i)
+            if (untransformed(imp[i].first)) {
+                from.AddImpulse(fromId, imp[i].first, -imp[i].second, next);
+                if (to) to->AddImpulse(toId, imp[i].first, imp[i].second, next);
+            }
+        if (next == 0) return;
+        const ConvKernel& k = *from.inputs_[static_cast<size_t>(fromId)].k;
+        for (size_t lv = 1; lv < from.levels_.size() && lv < k.levels.size(); ++lv) {
+            const ConvLevel& K = k.levels[lv];
+            if (K.parts == 0) continue;
+            Level& LF = from.levels_[lv];
+            Level* LT = to ? &to->levels_[lv] : nullptr;
+            const int m = LF.m, n = m * B, size = LF.size;
+            const int64_t cur = static_cast<int64_t>((next - 1) / static_cast<uint64_t>(m));   // output chunk playing
+            const int64_t jT = cur - 2;                                                         // last chunk transformed
+            int64_t jMin = INT64_MAX;
+            for (size_t i = 0; i < count; ++i) {
+                const int64_t j = static_cast<int64_t>(imp[i].first / static_cast<uint64_t>(n));
+                if (j <= jT) jMin = (std::min)(jMin, j);
+            }
+            if (jMin == INT64_MAX) continue;
+            Grow(LF, cur + 1, static_cast<size_t>(K.parts));
+            if (LT) Grow(*LT, cur + 1, static_cast<size_t>(K.parts));
+            std::vector<Cf> z(static_cast<size_t>(size)), zn(static_cast<size_t>(size)), ycur(static_cast<size_t>(size), Cf(0.0f, 0.0f));
+            bool curLive = false;
+            // The window [chunk j - 1, chunk j] of the moved impulses.
+            auto window = [&](int64_t j, bool firstHalfOnly) {
+                std::fill(z.begin(), z.end(), Cf(0.0f, 0.0f));
+                const int64_t lo = firstHalfOnly ? j * n : (j - 1) * n, hi = firstHalfOnly ? (j + 1) * n : (j + 1) * n;
+                bool any = false;
+                for (size_t i = 0; i < count; ++i) {
+                    const int64_t f = static_cast<int64_t>(imp[i].first);
+                    if (f < lo || f >= hi) continue;
+                    z[static_cast<size_t>(f - lo)] += Cf(imp[i].second, 0.0f);
+                    any = true;
+                }
+                return any;
+            };
+            auto slot = [](Level& L, int64_t t, int size) -> Cf* {
+                const size_t s = static_cast<size_t>(t % static_cast<int64_t>(L.acc.size()));
+                if (!L.accLive[s]) { L.acc[s].assign(static_cast<size_t>(size), Cf(0.0f, 0.0f)); L.accLive[s] = 1u; }
+                return L.acc[s].data();
+            };
+            for (int64_t j = jMin; j <= jT; ++j) {
+                if (!window(j, false)) continue;
+                LF.fft->Run(z.data(), false);
+                for (int i = 0; i < size; ++i) zn[static_cast<size_t>(i)] = -z[static_cast<size_t>(i)];
+                for (int64_t p = 0; p < K.parts; ++p) {
+                    const int64_t t = j + 2 + p;
+                    if (t < cur) continue;
+                    const float* h = reinterpret_cast<const float*>(&K.h[static_cast<size_t>(p) * static_cast<size_t>(size)]);
+                    if (t == cur) {
+                        Mul(reinterpret_cast<float*>(ycur.data()), reinterpret_cast<const float*>(z.data()), h, size, true);
+                        curLive = true;
+                        continue;
+                    }
+                    Mul(reinterpret_cast<float*>(slot(LF, t, size)), reinterpret_cast<const float*>(zn.data()), h, size, true);
+                    if (LT) Mul(reinterpret_cast<float*>(slot(*LT, t, size)), reinterpret_cast<const float*>(z.data()), h, size, true);
+                }
+            }
+            if (curLive) {
+                // The chunk being played: its rest (from the next block) in the level's output, the processed block
+                // in the group's sum.
+                LF.fft->Run(ycur.data(), true);
+                const float scale = 1.0f / static_cast<float>(size);
+                const int off = static_cast<int>((next - 1) % static_cast<uint64_t>(m)) * B;
+                auto apply = [&](Level& L, float sign, float* const pre[2]) {
+                    float* oL = &L.out[static_cast<size_t>(cur & 1) * 2 * static_cast<size_t>(n)];
+                    float* oR = oL + n;
+                    if (!L.outLive[cur & 1]) { std::fill(oL, oR + n, 0.0f); L.outLive[cur & 1] = true; }
+                    for (int i = off + B; i < n; ++i) {
+                        oL[i] += sign * ycur[static_cast<size_t>(n + i)].real() * scale;
+                        oR[i] += sign * ycur[static_cast<size_t>(n + i)].imag() * scale;
+                    }
+                    for (int i = static_cast<int>(fromOffset); i < B; ++i) {
+                        pre[0][i] += sign * ycur[static_cast<size_t>(n + off + i)].real() * scale;
+                        pre[1][i] += sign * ycur[static_cast<size_t>(n + off + i)].imag() * scale;
+                    }
+                };
+                apply(LF, -1.0f, fromPre);
+                if (LT) apply(*LT, 1.0f, toPre);
+            }
+            // G_jT, which the next chunk's window takes from the input.
+            if (window(jT, true)) {
+                LF.fft->Run(z.data(), false);
+                auto fold = [&](Input& in, float sign) {
+                    Cf* prev = in.prev[lv].data();
+                    if (!in.prevLive[lv]) { std::fill(prev, prev + size, Cf(0.0f, 0.0f)); in.prevLive[lv] = 1u; }
+                    for (int i = 0; i < size; ++i) prev[i] += sign * z[static_cast<size_t>(i)];
+                };
+                fold(from.inputs_[static_cast<size_t>(fromId)], -1.0f);
+                if (to) fold(to->inputs_[static_cast<size_t>(toId)], 1.0f);
+            }
+        }
+    }
+
     // Adds block `b`'s output (block frames per side) to outL/outR. Blocks are absolute (frame b * block on) and
     // consecutive. Returns false if it added nothing.
     bool Process(float* outL, float* outR, uint64_t b) {
