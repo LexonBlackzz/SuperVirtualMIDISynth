@@ -46,9 +46,15 @@ public:
     static constexpr uint32_t kChannels = 16u;
     static constexpr uint32_t kDirectBlocks = 8u;   // the span of the kernels' missing level 0
 
-    void Configure(uint32_t block) {
+    // m0 > 1: a delayed bus. Its convolution is one level of m0 blocks (MakeKernel), a fraction of the arithmetic
+    // of 1, 4, 16 blocks, which needs each chunk's input before the chunk is output: the host renders the bus
+    // Delay() frames behind its events (Render at frame - Delay()) and delays everything else to match. Only for
+    // notes given at their note-on (SetLevel0); a reset ahead of the output is a cut on every channel.
+    void Configure(uint32_t block, int m0 = 1) {
         block_ = block;
-        ring_ = 2u * kDirectBlocks * block;   // whole blocks, more than a note's direct span past the open block
+        m0_ = m0;
+        ahead_ = m0 > 1 ? m0 + 1 : 0;   // the delay, and a block for events not on the grid
+        ring_ = (2u * kDirectBlocks + uint32_t(ahead_) + 2u) * block;   // whole blocks, past a note's direct span
         groups_.clear();
         for (uint32_t i = 0; i < kChannels; ++i) NewGroup();
         for (Chan& h : chan_) h = Chan{};
@@ -61,6 +67,10 @@ public:
     }
     uint32_t Block() const noexcept { return block_; }
     uint32_t Direct() const noexcept { return kDirectBlocks * block_; }
+    uint32_t Delay() const noexcept { return m0_ > 1 ? uint32_t(m0_) * block_ : 0u; }
+    // The kernels' layout (KernelStore::Start).
+    int KernelLevels() const noexcept { return m0_ > 1 ? 1 : 3; }
+    int FirstLevelBlocks() const noexcept { return m0_; }
     // Off: every channel keeps a group of its own (the bus before groups; tests compare the two).
     void SetSharing(bool on) noexcept { share_ = on; }
     // On: the kernels keep level 0 (KernelStore keepLevel0), so a note's direct part is a correction of its held
@@ -70,12 +80,13 @@ public:
 
     // Whether a note on `channel` at `frame` can still join as a same-block note.
     bool Open(uint8_t channel, uint64_t frame) const noexcept {
-        return block_ && frame >= processedEnd_ && !CutPending(chan_[channel & 15u]);
+        return block_ && frame >= processedEnd_ && frame < processedEnd_ + uint64_t(ahead_ + 1) * block_ &&
+               !CutPending(chan_[channel & 15u]);
     }
     // Whether a late note's impulse at `on` can still join the convolution (every bank has the same levels).
     bool Insertable(uint8_t channel, uint64_t on) const noexcept {
         return block_ && !CutPending(chan_[channel & 15u]) &&
-               groups_[0]->bank.Insertable(on, processedEnd_ / block_, false);
+               groups_[0]->bank.Insertable(on, processedEnd_ / block_, m0_ > 1);
     }
     uint64_t BlockEnd(uint64_t frame) const noexcept { return (frame / block_ + 1u) * block_; }
     // The first frame not yet output-ready: frames from here on can still take direct sound.
@@ -272,7 +283,7 @@ private:
         g->pre[0].assign(block_, 0.0f); g->pre[1].assign(block_, 0.0f);
         g->dir[0].assign(ring_, 0.0f); g->dir[1].assign(ring_, 0.0f);
         g->bank.SetParallel(par_, parUser_, lanes_);
-        g->bank.Prepare(static_cast<int>(block_));
+        g->bank.Prepare(static_cast<int>(block_), KernelLevels(), m0_, ahead_);
         groups_.push_back(std::move(g));
     }
     // A kernel key names one kernel (the store's), so the kernel's dense index finds the input without the map.
@@ -558,7 +569,8 @@ private:
     }
 
     uint32_t block_ = 0, ring_ = 1;
-    uint64_t processedEnd_ = 0;    // the grid block before this is processed; this one is open
+    int m0_ = 1, ahead_ = 0;       // the kernels' first level, in blocks; how far past the open block input can come
+    uint64_t processedEnd_ = 0;   // the grid block before this is processed; this one is open
     uint64_t outFrom_ = 0;         // the next frame Render outputs
     bool share_ = true;
     bool level0_ = false;

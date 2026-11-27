@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -287,13 +288,22 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
         keep->SetRawMix(true);
         keep->SetReleaseBusSharing(share);
         if (features & 128) keep->SetRowOpBudgetForTest(0);   // 128: every mix CC splits its block into stretches
+        if (features & 256) _putenv("SVMS_BUS_DELAY=0");   // 256: the lookahead without the delayed bus
         const uint32_t lookahead = (features & 64) ? keep->EnableBusLookahead() : 0u;
+        _putenv("SVMS_BUS_DELAY=");
+        // A delayed bus's output comes late: render that much more and drop it from the front.
+        const uint32_t delay = keep->OutputDelay(), total = frames + delay;
+        if ((features & 64) && busOn) {
+            char what[120];
+            std::snprintf(what, sizeof what, "the lookahead bus is delayed %u frames (%s)", delay, features & 256 ? "no" : "yes");
+            Check((delay != 0) == !(features & 256), what);
+        }
         RealtimeBlockRenderer blocks;
-        l.assign(frames, 0.0f);
-        r.assign(frames, 0.0f);
+        l.assign(total, 0.0f);
+        r.assign(total, 0.0f);
         size_t next = 0;
-        for (uint32_t f = 0; f < frames; f += block) {
-            const uint32_t n = (std::min)(block, frames - f);
+        for (uint32_t f = 0; f < total; f += block) {
+            const uint32_t n = (std::min)(block, total - f);
             size_t end = next;
             while (end < song.size() && song[end].targetFrame < f + n) ++end;
             if (features & 64) {   // the offline renderer's lookahead
@@ -305,6 +315,8 @@ void RunBus(const std::wstring& sf2, int features, const char* name) {
             keep->SetBusLookahead(nullptr, 0);
             next = end;
         }
+        l.erase(l.begin(), l.begin() + delay);
+        r.erase(r.begin(), r.begin() + delay);
     };
     std::vector<float> offL, offR, onL, onR;
     StandaloneSynth* off = nullptr;
@@ -380,6 +392,9 @@ int main() {
     RunBus(sf2, 64, "lookahead");
     RunBus(sf2, 79, "lookahead, everything");
     RunBus(sf2, 127, "lookahead, one mix, everything");
+    RunBus(sf2, 127 | 256, "lookahead, one mix, everything, no delay");
+    RunBus(sf2, 64 | 256, "lookahead, no delay");
+    RunBus(sf2, 79 | 256, "lookahead, everything, no delay");
     RunBus(sf2, 129, "mix automation, split blocks");
     RunBus(sf2, 193, "lookahead, mix automation, split blocks");
     std::remove(path.c_str());

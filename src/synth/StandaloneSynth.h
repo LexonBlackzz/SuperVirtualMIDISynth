@@ -386,7 +386,7 @@ public:
     double ReleaseBusConvolutionsPerBlock() const {
         return bus_.Blocks() ? double(bus_.Convolved()) / double(bus_.Blocks()) : 0.0;
     }
-    void SetReleaseBusSharing(bool on) { bus_.SetSharing(on); }
+    void SetReleaseBusSharing(bool on) { busShare_ = on; bus_.SetSharing(on); }
     // A host that knows what is coming (the offline renderer) calls EnableBusLookahead before rendering, then gives
     // the events up to the returned frames past each render call's end, sorted, before the call (SetBusLookahead;
     // events an earlier call gave may be left out), and clears it after. The bus pairs a note-on with a note-off
@@ -398,7 +398,7 @@ public:
         if (!busOn_) return 0u;
         if (!busAheadOn_) {
             busAheadOn_ = true;
-            StartBusKernels();
+            StartBus();   // the delayed layout, kernels with level 0
         }
         return bus_.Direct();
     }
@@ -407,6 +407,10 @@ public:
         busAheadCount_ = count;
     }
     uint32_t BusLookaheadFrames() const { return busOn_ && busAheadOn_ ? bus_.Direct() : 0u; }
+    // With the lookahead the bus renders behind its events (ReleaseBus::Configure), and the voices go through a
+    // delay line to meet it: output comes this many frames late. The host drops that many frames first and renders
+    // as many more at the end. SVMS_BUS_DELAY=0: the 1, 4, 16 block layout, no delay.
+    uint32_t OutputDelay() const { return busOn_ ? busDelay_ : 0u; }
     size_t ReleaseBusHistories() const { return bus_.Histories(); }
     size_t ReleaseBusKernelBytes() const { return busKernels_.Bytes(); }
     double BusMsPerSecond(uint64_t ns) const {
@@ -568,9 +572,7 @@ public:
                                   frameCount, cfg_, nullptr, 0, true,
                                   absoluteFrame);
             if (busOn_) {
-                const auto busT0 = std::chrono::steady_clock::now();
-                bus_.Render(left, right, frameCount, absoluteFrame);
-                busRenderNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busT0).count());
+                RenderBus(left, right, frameCount, absoluteFrame);
             }
             if (!rawMix_) PostProcess(left, right, frameCount);
         }
@@ -729,9 +731,7 @@ public:
 #endif
         if (busOn_) {
             busPlan_.clear();
-            const auto busT0 = std::chrono::steady_clock::now();
-            bus_.Render(left, right, frameCount, absoluteFrame);
-            busRenderNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busT0).count());
+            RenderBus(left, right, frameCount, absoluteFrame);
         }
         if (!rawMix_) PostProcess(left, right, frameCount);
     }
@@ -906,7 +906,11 @@ public:
         }
         if (busOn_) {
             busFrame_ = absoluteFrame;
-            bus_.Reset(absoluteFrame);
+            if (busDelay_) {   // ahead of the delayed bus's output: its tails stop there
+                for (uint8_t channel = 0; channel < kChannelCount; ++channel) bus_.Cut(channel, absoluteFrame);
+            } else {
+                bus_.Reset(absoluteFrame);
+            }
             std::fill(keyHeld_.begin(), keyHeld_.end(), 0u);
             std::fill(busOff_.begin(), busOff_.end(), UINT64_MAX);
             for (BusKey& k : busKeys_) k.offs.clear();   // the lookahead's pairing (open, pairs) is ahead of this
@@ -1318,9 +1322,15 @@ private:
     // Everything else is a voice, as before.
 
     void StartBus() {
-        bus_.Configure(busBlock_);
+        const char* delay = std::getenv("SVMS_BUS_DELAY");
+        bus_.Configure(busBlock_, busAheadOn_ && !(delay && !std::strcmp(delay, "0")) ? kBusDelayBlocks : 1);
+        busDelay_ = bus_.Delay();
+        if (busLine_[0].size() != busDelay_) {
+            for (auto& line : busLine_) line.assign(busDelay_, 0.0f);
+            busLinePos_ = 0;
+        }
         bus_.SetParallel(&RenderScalar::ParallelFor, &renderer_, renderer_.GetRenderThreadCount());
-        bus_.SetSharing(std::getenv("SVMS_BUS_NO_SHARE") == nullptr);   // A/B runs: one group per channel
+        bus_.SetSharing(busShare_);
         keyHeld_.assign(size_t(kChannelCount) * kNoteCount, 0u);
         busOff_.assign(size_t(kChannelCount) * kNoteCount, UINT64_MAX);
         busPend_.assign(size_t(kChannelCount) * kNoteCount, BusPend{});
@@ -1331,6 +1341,29 @@ private:
         busLateOrder_.clear();
         busKill_.clear();
         for (uint8_t channel = 0; channel < kChannelCount; ++channel) BusMix(channel);
+    }
+
+    // Adds the bus to the voices in left/right, which are at `frame`. Delayed (busDelay_): the voices come out of
+    // the delay line busDelay_ frames late, and the bus is rendered at that frame (silence before frame 0).
+    void RenderBus(float* left, float* right, uint32_t n, uint64_t frame) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!busDelay_) {
+            bus_.Render(left, right, n, frame);
+        } else {
+            float* line[2] = {busLine_[0].data(), busLine_[1].data()};
+            float* io[2] = {left, right};
+            uint32_t pos = busLinePos_;
+            for (uint32_t i = 0; i < n; ++i) {
+                for (int s = 0; s < 2; ++s) std::swap(io[s][i], line[s][pos]);
+                if (++pos == busDelay_) pos = 0;
+            }
+            busLinePos_ = pos;
+            if (frame + n > busDelay_) {
+                const uint32_t skip = frame < busDelay_ ? uint32_t(busDelay_ - frame) : 0u;
+                bus_.Render(left + skip, right + skip, n - skip, frame + skip - busDelay_);
+            }
+        }
+        busRenderNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
 
     // The kernel store, empty. With a lookahead the kernels keep level 0 (EnableBusLookahead).
@@ -1350,7 +1383,8 @@ private:
                 if (!ReleaseKernelSource(uint32_t(key >> 40), local, uint8_t(key), sources.back())) return false;
             }
             return true;
-        }, bus_.Direct(), int(busBlock_), busBudget_, 3, /*background=*/false, /*keepLevel0=*/busAheadOn_);
+        }, bus_.Direct(), int(busBlock_), busBudget_, bus_.KernelLevels(), /*background=*/false,
+           /*keepLevel0=*/busAheadOn_, bus_.FirstLevelBlocks());
     }
 
     // The kernel for a note the bus could take, checking what must hold for the note's whole life: one unit,
@@ -2045,6 +2079,11 @@ private:
     bool busOn_ = false;
     size_t busBudget_ = 0;
     uint32_t busBlock_ = 0;
+    static constexpr int kBusDelayBlocks = 32;   // a delayed bus's first level (ReleaseBus::Configure)
+    uint32_t busDelay_ = 0;                      // frames: the bus renders this far behind, the voices wait
+    bool busShare_ = std::getenv("SVMS_BUS_NO_SHARE") == nullptr;   // off: one group per channel (A/B runs)
+    std::vector<float> busLine_[2];              // the voices' delay line
+    uint32_t busLinePos_ = 0;
     uint64_t busFrame_ = 0;   // output frame of the event being applied
     uint64_t busNotes_ = 0;
     uint32_t busCall_ = 0;

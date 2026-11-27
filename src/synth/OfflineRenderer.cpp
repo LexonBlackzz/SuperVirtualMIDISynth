@@ -770,6 +770,9 @@ public:
     // far past a call it wants events (0: none); then those events (the ones not given before), for the next
     // RenderEvents call only.
     virtual uint32_t EnableBusLookahead() { return 0u; }
+    // Frames the output comes late (StandaloneSynth::OutputDelay): the caller drops that many first and renders as
+    // many more at the end.
+    virtual uint32_t OutputDelay() const { return 0u; }
     virtual void SetBusLookahead(const RealtimeEvent*, size_t) {}
     // Pipelined blocks (batched path): Stage hands over the next block's events and bus lookahead, which must stay
     // valid until its Wait, and may be called while the previous block still renders; Wait returns once the block
@@ -861,6 +864,7 @@ public:
         return true;
     }
     uint32_t EnableBusLookahead() override { return synth_.EnableBusLookahead(); }
+    uint32_t OutputDelay() const override { return synth_.OutputDelay(); }
     void SetBusLookahead(const RealtimeEvent* events, size_t count) override { ahead_ = events; aheadCount_ = count; }
     void PhaseCycles(uint64_t (&out)[3]) const override {
         out[0] = synth_.WvPlanCycles(); out[1] = synth_.WvJobCycles();
@@ -958,6 +962,7 @@ public:
         for (auto& s : shards_) frames = s->EnableBusLookahead();
         return frames;
     }
+    uint32_t OutputDelay() const override { return shards_[0]->OutputDelay(); }
     void SetBusLookahead(const RealtimeEvent* events, size_t count) override { ahead_ = events; aheadCount_ = count; }
     bool RenderEvents(const RealtimeEvent* events, size_t count, float* left,
                       float* right, uint32_t frames, uint64_t frame) override {
@@ -1756,6 +1761,13 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
     // With reverb on, keep rendering the tail until it has faded (-100 dB).
     const bool reverbRinging = synth->ReverbActive();
     float lastPeak = 1.0f;
+    // Output that comes late (OutputDelay): its first frames are dropped, and as many rendered at the end.
+    uint64_t outputSkip = 0;
+    const auto write = [&](const float* l, const float* r, uint32_t n) {
+        const uint32_t s = static_cast<uint32_t>((std::min<uint64_t>)(outputSkip, n));
+        outputSkip -= s;
+        return s == n || wave.Write(l + s, r + s, n - s);
+    };
     auto renderTo = [&](uint64_t target) {
         while (frame < target && ioOk && !pollCancel()) {
             const uint32_t n = static_cast<uint32_t>(
@@ -1766,7 +1778,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
             renderNs += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     dspEnd - dspStart).count());
-            ioOk = wave.Write(left.data(), right.data(), n);
+            ioOk = write(left.data(), right.data(), n);
             frame += n;
             if (reverbRinging) {
                 float peak = 0.0f;
@@ -1833,6 +1845,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
         // The release bus pairs notes up to this far past a block: events are read that far ahead and handed to
         // it with each block (none with jitter, which reorders them).
         const uint64_t lookahead = jitterFrames ? 0u : synth->EnableBusLookahead();
+        outputSkip = synth->OutputDelay();
         // ahead: read, at or past the block's end, from aheadAt on; fresh: read for this block (what the bus has not seen)
         std::vector<RealtimeEvent> ahead, freshes[2], blocks[2];
         size_t aheadAt = 0;
@@ -1849,7 +1862,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
             renderNs += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - dspStart).count());
-            ioOk = wave.Write(outs[flight][0].data(), outs[flight][1].data(), flightFrames);
+            ioOk = write(outs[flight][0].data(), outs[flight][1].data(), flightFrames);
             frame += flightFrames;
             peakVoices = (std::max)(peakVoices, synth->Active());
             reportRender(false);
@@ -1987,6 +2000,8 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
             }
             tailFrames = frame > info.totalFrames
                 ? frame - info.totalFrames : 0u;
+            // A delayed output's last frames (OutputDelay).
+            if (const uint32_t late = synth->OutputDelay()) renderTo(frame + late);
         }
     }
 

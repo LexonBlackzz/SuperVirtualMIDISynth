@@ -103,8 +103,8 @@ bool ZeroLatency() {
 }
 
 // A bank of three inputs against three kernels (one, two and three levels; the last input joins late) is the sum
-// of the three direct convolutions.
-bool BankMatchesDirect() {
+// of the three direct convolutions. With a first level of m0 > 1 blocks the input comes m0 blocks ahead.
+bool BankMatchesDirect(int m0 = 1, int levels = 3) {
     const int block = 64, blocks = 260, frames = block * blocks;
     const int lengths[3] = {64 * 6, 64 * 30, 64 * 45 + 17};
     Kernel kern[3];
@@ -112,20 +112,22 @@ bool BankMatchesDirect() {
     std::vector<float> x[3];
     for (int i = 0; i < 3; ++i) {
         kern[i] = RandomKernel(lengths[i], 20u + i);
-        k.push_back(MakeKernel(kern[i].l.data(), kern[i].r.data(), lengths[i], block, 3));
+        k.push_back(MakeKernel(kern[i].l.data(), kern[i].r.data(), lengths[i], block, levels, m0));
         x[i] = RandomInput(frames, 30u + i);
     }
     const int join = 37;   // the third input is silent before block 37 and added there
     std::fill(x[2].begin(), x[2].begin() + join * block, 0.0f);
+    const int ahead = m0 > 1 ? m0 : 0;
     svms::bus::ConvBank bank;
-    bank.Prepare(block, 3);
+    bank.Prepare(block, levels, m0, ahead);
     int id[3] = {bank.Add(k[0]), bank.Add(k[1]), -1};
     std::vector<float> got(static_cast<size_t>(2 * frames), 0.0f);
-    for (int b = 0; b < blocks; ++b) {
-        if (b == join) id[2] = bank.Add(k[2]);
-        for (int i = 0; i < 3; ++i)
-            if (id[i] >= 0) std::memcpy(bank.InputBlock(id[i]), &x[i][static_cast<size_t>(b * block)], sizeof(float) * block);
-        bank.Process(&got[static_cast<size_t>(b * block)], &got[static_cast<size_t>(frames + b * block)], static_cast<uint64_t>(b));
+    for (int b = -ahead; b < blocks; ++b) {   // the first blocks' input before any output
+        const int in = b + ahead;   // the block whose input comes now
+        if (in == join) id[2] = bank.Add(k[2]);
+        for (int i = 0; i < 3 && in < blocks; ++i)
+            if (id[i] >= 0) std::memcpy(bank.InputBlock(id[i], static_cast<uint64_t>(in)), &x[i][static_cast<size_t>(in * block)], sizeof(float) * block);
+        if (b >= 0) bank.Process(&got[static_cast<size_t>(b * block)], &got[static_cast<size_t>(frames + b * block)], static_cast<uint64_t>(b));
     }
     double peak = 0.0, err = 0.0;
     for (int side = 0; side < 2; ++side)
@@ -140,7 +142,8 @@ bool BankMatchesDirect() {
         }
     const double e = err / (std::max)(peak, 1e-30);
     const bool ok = e < 2e-6;
-    std::printf("%s bank of three: error %.2e of peak\n", ok ? "PASS" : "FAIL", e);
+    std::printf("%s bank of three (first level %d blocks, %d levels): error %.2e of peak\n", ok ? "PASS" : "FAIL", m0,
+                levels, e);
     return ok;
 }
 
@@ -189,10 +192,12 @@ bool LateImpulses() {
 // Moved impulses: a bus kernel (no level 0), impulses on time into bank A; after block `at` - 1 the impulses
 // marked moved go from A to B (null: dropped) from that block's frame `offset` on, and the later ones straight to
 // B. A then sounds the kept impulses, and the moved ones only before the move; B the moved ones only after it.
-bool MovedImpulses(int at, int offset, bool drop, unsigned seed, bool level0 = false) {
+// With a first level of m0 > 1 blocks the impulses come m0 blocks ahead.
+bool MovedImpulses(int at, int offset, bool drop, unsigned seed, bool level0 = false, int m0 = 1, int levels = 3) {
     const int block = 64, blocks = 300, frames = block * blocks, length = 64 * 45 + 17;
+    const int ahead = m0 > 1 ? m0 : 0;
     Kernel kern = RandomKernel(length, seed);
-    ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, 3);
+    ConvKernel k = MakeKernel(kern.l.data(), kern.r.data(), length, block, levels, m0);
     if (!level0) {   // the bus kernels without a lookahead
         k.levels[0].parts = 0;
         k.levels[0].h.clear();
@@ -209,27 +214,28 @@ bool MovedImpulses(int at, int offset, bool drop, unsigned seed, bool level0 = f
         (imps.back().moved ? moved : kept)[static_cast<size_t>(imps.back().frame)] += imps.back().w;
     }
     svms::bus::ConvBank a, b;
-    a.Prepare(block, 3);
-    b.Prepare(block, 3);
+    a.Prepare(block, levels, m0, ahead);
+    b.Prepare(block, levels, m0, ahead);
     const int ia = a.Add(k), ib = b.Add(k);
     std::vector<float> outA(static_cast<size_t>(2 * frames), 0.0f), outB(outA);
     const int moveFrame = (at - 1) * block + offset;
-    for (int bl = 0; bl < blocks; ++bl) {
+    for (int bl = -ahead; bl < blocks; ++bl) {
         if (bl == at) {
             std::vector<std::pair<uint64_t, float>> list;
             for (const Imp& m : imps)
-                if (m.moved && m.frame < at * block) list.emplace_back(static_cast<uint64_t>(m.frame), m.w);
+                if (m.moved && m.frame < (at + ahead) * block) list.emplace_back(static_cast<uint64_t>(m.frame), m.w);
             float* const preA[2] = {&outA[static_cast<size_t>((at - 1) * block)], &outA[static_cast<size_t>(frames + (at - 1) * block)]};
             float* const preB[2] = {&outB[static_cast<size_t>((at - 1) * block)], &outB[static_cast<size_t>(frames + (at - 1) * block)]};
             svms::bus::ConvBank::Move(a, ia, drop ? nullptr : &b, ib, list.data(), list.size(), static_cast<uint64_t>(at),
                                       static_cast<uint32_t>(offset), preA, preB);
         }
         for (const Imp& m : imps)
-            if (m.frame / block == bl) {
+            if (m.frame / block == bl + ahead) {
                 const bool toB = m.moved && bl >= at;
                 if (toB && drop) continue;
                 (toB ? b : a).AddImpulse(toB ? ib : ia, static_cast<uint64_t>(m.frame), m.w, static_cast<uint64_t>(bl));
             }
+        if (bl < 0) continue;
         a.Process(&outA[static_cast<size_t>(bl * block)], &outA[static_cast<size_t>(frames + bl * block)], static_cast<uint64_t>(bl));
         b.Process(&outB[static_cast<size_t>(bl * block)], &outB[static_cast<size_t>(frames + bl * block)], static_cast<uint64_t>(bl));
     }
@@ -251,8 +257,9 @@ bool MovedImpulses(int at, int offset, bool drop, unsigned seed, bool level0 = f
     errA /= (std::max)(peak, 1e-30);
     errB /= (std::max)(peak, 1e-30);
     const bool ok = errA < 2e-6 && errB < 2e-6;
-    std::printf("%s moved impulses (after block %d, frame %d of it%s): error %.2e / %.2e of peak\n", ok ? "PASS" : "FAIL",
-                at - 1, offset, drop ? (level0 ? ", dropped, level 0" : ", dropped") : (level0 ? ", level 0" : ""), errA, errB);
+    std::printf("%s moved impulses (after block %d, frame %d of it%s, first level %d blocks): error %.2e / %.2e of peak\n",
+                ok ? "PASS" : "FAIL", at - 1, offset,
+                drop ? (level0 ? ", dropped, level 0" : ", dropped") : (level0 ? ", level 0" : ""), m0, errA, errB);
     return ok;
 }
 
@@ -271,7 +278,7 @@ bool AvxMatchesScalar() {
         const int id = bank.Add(k);
         out[pass].assign(static_cast<size_t>(2 * frames), 0.0f);
         for (int b = 0; b < blocks; ++b) {
-            std::memcpy(bank.InputBlock(id), &x[static_cast<size_t>(b * block)], sizeof(float) * block);
+            std::memcpy(bank.InputBlock(id, static_cast<uint64_t>(b)), &x[static_cast<size_t>(b * block)], sizeof(float) * block);
             bank.Process(&out[pass][static_cast<size_t>(b * block)], &out[pass][static_cast<size_t>(frames + b * block)], static_cast<uint64_t>(b));
         }
     }
@@ -304,7 +311,7 @@ bool ParallelMatchesSerial() {
         out[pass].assign(static_cast<size_t>(2 * frames), 0.0f);
         for (int b = 0; b < blocks; ++b) {
             for (int i = 0; i < inputs; ++i)
-                std::memcpy(bank.InputBlock(id[static_cast<size_t>(i)]), &x[static_cast<size_t>(i)][static_cast<size_t>(b * block)], sizeof(float) * block);
+                std::memcpy(bank.InputBlock(id[static_cast<size_t>(i)], static_cast<uint64_t>(b)), &x[static_cast<size_t>(i)][static_cast<size_t>(b * block)], sizeof(float) * block);
             bank.Process(&out[pass][static_cast<size_t>(b * block)], &out[pass][static_cast<size_t>(frames + b * block)], static_cast<uint64_t>(b));
         }
     }
@@ -353,17 +360,21 @@ void Bench() {
                 audio / s);
 }
 
-// A bank at the load of one DYHTM shard: 210 inputs on 5 s kernels, each taking a note in about one block in four.
+// A bank at the load of one DYHTM shard: 210 inputs on kernels of `lengthBlocks` blocks (CF-162's are 149), each
+// taking a note in about one block in four. A first level of m0 > 1 blocks takes its input m0 blocks ahead.
 // Informational: time per second of 48 kHz output.
-void BenchBank(int kernels, int levels) {
-    const int block = 1024, length = 240000, inputs = 210, blocks = 1000;
+void BenchBank(int kernels, int levels, int m0, int lengthBlocks) {
+    const int block = 1024, length = lengthBlocks * block, inputs = 210, blocks = 1000;
+    const int ahead = m0 > 1 ? m0 : 0;
     std::vector<ConvKernel> k;
     for (int i = 0; i < kernels; ++i) {
         const Kernel kern = RandomKernel(length, 40u + i);
-        k.push_back(MakeKernel(kern.l.data(), kern.r.data(), length, block, levels));
+        k.push_back(MakeKernel(kern.l.data(), kern.r.data(), length, block, levels, m0));
     }
+    std::printf("bank bench: %d levels of %d, %d, ... blocks, %.0f flops per frame per input\n", levels, m0, 4 * m0,
+                svms::bus::FlopsPerFrame(k[0]));
     svms::bus::ConvBank bank;
-    bank.Prepare(block, levels);
+    bank.Prepare(block, levels, m0, ahead);
     std::vector<int> id;
     for (int i = 0; i < inputs; ++i) id.push_back(bank.Add(k[static_cast<size_t>(i % kernels)]));
     std::mt19937 rng(5);
@@ -373,7 +384,7 @@ void BenchBank(int kernels, int levels) {
     for (int b = 0; b < blocks; ++b) {
         for (int i = 0; i < inputs; ++i) {
             const int at = when(rng);
-            if (at < block) bank.InputBlock(id[static_cast<size_t>(i)])[at] = 0.5f;
+            if (at < block) bank.InputBlock(id[static_cast<size_t>(i)], static_cast<uint64_t>(b + ahead))[at] = 0.5f;
         }
         bank.Process(l.data(), r.data(), static_cast<uint64_t>(b));
     }
@@ -385,7 +396,11 @@ void BenchBank(int kernels, int levels) {
 
 int main(int argc, char** argv) {
     if (argc > 1 && !std::strcmp(argv[1], "--bench")) { Bench(); return 0; }
-    if (argc > 1 && !std::strcmp(argv[1], "--bench-bank")) { BenchBank(argc > 2 ? std::atoi(argv[2]) : 8, argc > 3 ? std::atoi(argv[3]) : 3); return 0; }
+    if (argc > 1 && !std::strcmp(argv[1], "--bench-bank")) {   // [kernels levels m0 lengthBlocks]
+        const auto arg = [&](int i, int d) { return argc > i ? std::atoi(argv[i]) : d; };
+        BenchBank(arg(2, 8), arg(3, 3), arg(4, 1), arg(5, 149));
+        return 0;
+    }
     bool ok = true;
     ok &= MatchesDirect(64, 10, 3, 20, 1, "shorter than a block");
     ok &= MatchesDirect(64, 64 * 8, 3, 40, 2, "level 0 only");
@@ -395,6 +410,9 @@ int main(int argc, char** argv) {
     ok &= MatchesDirect(64, 64 * 45 + 17, 1, 120, 6, "one uniform level");
     ok &= ZeroLatency();
     ok &= BankMatchesDirect();
+    ok &= BankMatchesDirect(4, 1);
+    ok &= BankMatchesDirect(8, 1);
+    ok &= BankMatchesDirect(2, 2);
     ok &= LateImpulses();
     ok &= MovedImpulses(9, 0, false, 70);
     ok &= MovedImpulses(40, 17, false, 71);
@@ -406,6 +424,10 @@ int main(int argc, char** argv) {
     ok &= MovedImpulses(41, 9, false, 77, true);
     ok &= MovedImpulses(128, 0, false, 78, true);
     ok &= MovedImpulses(201, 50, true, 79, true);
+    ok &= MovedImpulses(41, 9, false, 80, true, 8, 1);
+    ok &= MovedImpulses(128, 0, false, 81, true, 8, 1);
+    ok &= MovedImpulses(133, 63, false, 82, true, 4, 2);
+    ok &= MovedImpulses(201, 50, true, 83, true, 8, 1);
     ok &= AvxMatchesScalar();
     ok &= ParallelMatchesSerial();
     ok &= EvenWork();
