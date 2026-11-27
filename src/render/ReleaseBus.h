@@ -248,7 +248,9 @@ public:
 private:
     struct In { const ReleaseKernel* kernel; int id; uint64_t lastInput; };
     struct Change { uint64_t frame; float left, right; };
+    struct PendingSpan { const ReleaseKernel* k; uint64_t on, f0, f1; float sv, sw; };   // a held correction for the ring
     struct Group {
+        std::vector<PendingSpan> spans;   // added to `dir` at the next block (FlushSpans)
         std::vector<float> pre[2];   // the processed block's sum before the mix gains
         std::vector<float> dir[2];   // direct sound of later frames, frame f at f % ring
         ConvBank bank;
@@ -463,27 +465,12 @@ private:
         if (level0_) {
             // While held the convolution gives w B where the note is v A: add v A - w B, with the B it convolves.
             const float sv = sign * v, sw = sign * w;
-            const auto span = [&](float* outL, float* outR, uint64_t f0, uint64_t f1) {
-                const size_t t0 = static_cast<size_t>(f0 - on), n = static_cast<size_t>(f1 - f0);
-                const float* aL = k->heldL.data() + t0;
-                const float* aR = k->heldR.data() + t0;
-                const float* bL = k->heldBL.data() + t0;
-                const float* bR = k->heldBR.data() + t0;
-                for (size_t i = 0; i < n; ++i) {
-                    outL[i] += sv * aL[i] - sw * bL[i];
-                    outR[i] += sv * aR[i] - sw * bR[i];
-                }
-            };
             const uint64_t mid = (std::min)((std::max)(from, processedEnd_), end);
             if (from < mid) {
-                span(g.pre[0].data() + (from - open), g.pre[1].data() + (from - open), from, mid);
+                Span(g.pre[0].data() + (from - open), g.pre[1].data() + (from - open), *k, on, from, mid, sv, sw);
                 g.preLive = true;
             }
-            if (mid < end) {   // the ring, wrapping at most once (a direct span is shorter than it)
-                const uint64_t slot = mid % ring_, wrap = (std::min)(end, mid + (ring_ - slot));
-                span(g.dir[0].data() + slot, g.dir[1].data() + slot, mid, wrap);
-                if (wrap < end) span(g.dir[0].data(), g.dir[1].data(), wrap, end);
-            }
+            if (mid < end) g.spans.push_back({k, on, mid, end, sv, sw});   // the ring's part waits for FlushSpans
             g.active = true;
             return;
         }
@@ -508,8 +495,36 @@ private:
         g.active = true;
     }
 
+    // Frames [f0, f1) of a held correction, sv A - sw B, added at outL/outR.
+    static void Span(float* outL, float* outR, const ReleaseKernel& k, uint64_t on, uint64_t f0, uint64_t f1,
+                     float sv, float sw) noexcept {
+        const size_t t0 = static_cast<size_t>(f0 - on), n = static_cast<size_t>(f1 - f0);
+        const float* aL = k.heldL.data() + t0;
+        const float* aR = k.heldR.data() + t0;
+        const float* bL = k.heldBL.data() + t0;
+        const float* bR = k.heldBR.data() + t0;
+        for (size_t i = 0; i < n; ++i) {
+            outL[i] += sv * aL[i] - sw * bL[i];
+            outR[i] += sv * aR[i] - sw * bR[i];
+        }
+    }
+    // The held corrections queued for the ring since the last block, in the order they came: the same sums, done
+    // together per group instead of between events. Each wraps the ring at most once (a direct span is shorter).
+    void FlushSpans() {
+        for (auto& gp : groups_) {
+            Group& g = *gp;
+            for (const PendingSpan& s : g.spans) {
+                const uint64_t slot = s.f0 % ring_, wrap = (std::min)(s.f1, s.f0 + (ring_ - slot));
+                Span(g.dir[0].data() + slot, g.dir[1].data() + slot, *s.k, s.on, s.f0, wrap, s.sv, s.sw);
+                if (wrap < s.f1) Span(g.dir[0].data(), g.dir[1].data(), *s.k, s.on, wrap, s.f1, s.sv, s.sw);
+            }
+            g.spans.clear();
+        }
+    }
+
     void Drop(int gi, uint64_t soundUntil) {
         Group& g = *groups_[size_t(gi)];
+        g.spans.clear();   // the ring is cleared below
         g.bank.RemoveAll();
         g.inputs.clear();
         g.fast.clear();
@@ -534,6 +549,7 @@ private:
         const uint64_t blockStart = processedEnd_;
         const uint64_t b = blockStart / block_;
         ++blocks_;
+        FlushSpans();
         for (size_t gi = 0; gi < groups_.size(); ++gi) {
             Group& g = *groups_[gi];
             bool live = g.active;
