@@ -89,6 +89,7 @@ struct Options {
     bool scanOnly = false;
     bool machineProgress = false;
     bool fullVelocity = false;         // --full-velocity: every note-on at velocity 127
+    bool releaseBus = false;           // --release-bus: the experimental release bus (StandaloneSynthConfig)
     int32_t minNoteMs = -1;            // --min-note-ms: minimum note length (-1 = engine config)
     bool bassMode = false;             // --bassmidi-mode: KMC-style BASSMIDI behaviour (note-table renderer)
     bool streamNoteTable = false;      // --bassmidi-stream: the windowed note-table renderer
@@ -358,6 +359,7 @@ void Usage() {
            L"  --stems MODE          One synth instance per note-bearing track, up to --render-threads at\n"
            L"                        once. separate: <out>_trackN.wav each; merge: summed into <out>; both\n"
            L"  --full-velocity       Play every note at velocity 127 (also makes note merging fold more)\n"
+           L"  --release-bus         Experimental: short notes ring out as convolutions, not voices (may be slower; more RAM)\n"
            L"  --min-note-ms N       Hold every note at least N ms (KMC 18.2.8 BASSMIDI does 4); note-table renderer only for now\n"
            L"  --bassmidi-mode       Approximate KMC/BASSMIDI: 4 ms min note, voice limit drops notes that are not louder, DC kept; renders the MIDI length + 3 s unless --max-seconds is given\n"
            L"  --note-table CAP      Experimental: render from a note table, not the live engine (MIDI length + 3 s unless --max-seconds)\n"
@@ -391,6 +393,7 @@ bool ParseOptions(int argc, wchar_t** argv, Options& o) {
         }
         else if (arg == L"--scan-only") o.scanOnly = true;
         else if (arg == L"--full-velocity") o.fullVelocity = true;
+        else if (arg == L"--release-bus") o.releaseBus = true;
         else if (arg == L"--min-note-ms") { uint32_t v = 0; const auto p=value(); if (!p || !ParseU32(p,0,200,v)) return false; o.minNoteMs = static_cast<int32_t>(v); }
         else if (arg == L"--bassmidi-mode") { o.bassMode = true; o.noteTable = true; o.minNoteMs = 4; g_keepDcOffset = true; }
         else if (arg == L"--bassmidi-stream") { o.bassMode = true; o.noteTable = true; o.streamNoteTable = true; o.minNoteMs = 4; g_keepDcOffset = true; }
@@ -839,6 +842,7 @@ public:
         config.gpuApi = o.gpuApi;
         config.uniformHalfRate = o.uniformHalfRate;
         config.gpuDeviceIndex = o.gpuDeviceIndex;
+        config.releaseBus = o.releaseBus;
         return synth_.Initialize(config, error);
     }
     void Dispatch(uint32_t message, uint64_t frame) override {

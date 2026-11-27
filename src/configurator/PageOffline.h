@@ -78,6 +78,7 @@ private:
     std::wstring soundFontPath_;
     std::wstring outputPath_;
     bool fullVelocity_ = false;  // --full-velocity
+    bool releaseBus_ = false;    // --release-bus (exact engine only)
     int shards_ = 1;             // --shards (1 = off)
     int renderMode_ = 0;         // 0 exact engine, 1 BASSMIDI-style (--bassmidi-mode)
     int stemMode_ = 0;  // 0 off, 1 separate, 2 merge, 3 both

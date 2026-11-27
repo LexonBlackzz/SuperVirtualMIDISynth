@@ -370,6 +370,7 @@ void OfflineRendererPage::Start(const ConfigDocument& document) {
         append(L"--stems"); append(kModes[stemMode_]);
     }
     if (fullVelocity_) append(L"--full-velocity");
+    if (releaseBus_ && renderMode_ == 0) append(L"--release-bus");
     if (renderMode_ == 1) append(L"--bassmidi-mode");
     if (shards_ > 1) { append(L"--shards"); append(std::to_wstring(shards_)); }
     if (stemTracks_[0]) { append(L"--tracks"); append(std::wstring(stemTracks_, stemTracks_ + std::strlen(stemTracks_))); }
@@ -665,6 +666,23 @@ void OfflineRendererPage::Draw(ConfigDocument& document, HWND owner) {
     ImGui::Checkbox("Full velocity##fullvel", &fullVelocity_);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Every note plays at velocity 127.");
+    ImGui::BeginDisabled(renderMode_ != 0);
+    ImGui::Checkbox("Release bus (experimental)##releasebus", &releaseBus_);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Short notes ring out through one shared convolution per key instead of each taking a voice,\n"
+                          "so a full voice pool steals far less. Exact engine only; off with GPU rendering or oversampling.\n"
+                          "It MAY be slower than a normal render, and uses more RAM: about 0.5 GB more per shard for its tails.\n"
+                          "Overlapping notes on a key can pair their note-offs differently, so it can sound slightly different.");
+    if (releaseBus_ && renderMode_ == 0) {
+        ui::PushText(0, 13.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, k.exp);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted("Experimental: may be slower than a normal render, and uses more RAM (about 0.5 GB more per shard).");
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        ui::PopFont();
+    }
     ImGui::SetNextItemWidth(220.0f * s);
     ImGui::SliderInt("Parallel shards##shards", &shards_, 1, 32);
     if (ImGui::IsItemHovered())
