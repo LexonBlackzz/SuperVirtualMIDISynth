@@ -281,6 +281,38 @@ bool AvxMatchesScalar() {
     return ok;
 }
 
+// A bank on threads gives the serial bank's bits: five inputs (one unpaired), three lanes, jobs run in reverse.
+bool ParallelMatchesSerial() {
+    const int block = 1024, blocks = 120, frames = block * blocks, length = 1024 * 45 + 17, inputs = 5;
+    std::vector<ConvKernel> k;
+    std::vector<std::vector<float>> x;
+    for (int i = 0; i < inputs; ++i) {
+        const Kernel kern = RandomKernel(length, 90u + i);
+        k.push_back(MakeKernel(kern.l.data(), kern.r.data(), length, block, 3));
+        x.push_back(RandomInput(frames, 95u + i));
+    }
+    const auto reverse = [](void*, uint32_t jobs, void (*job)(void*, uint32_t), void* context) {
+        for (uint32_t i = jobs; i-- > 0;) job(context, i);
+    };
+    std::vector<float> out[2];
+    for (int pass = 0; pass < 2; ++pass) {
+        svms::bus::ConvBank bank;
+        if (pass == 1) bank.SetParallel(reverse, nullptr, 3);
+        bank.Prepare(block, 3);
+        std::vector<int> id;
+        for (int i = 0; i < inputs; ++i) id.push_back(bank.Add(k[static_cast<size_t>(i)]));
+        out[pass].assign(static_cast<size_t>(2 * frames), 0.0f);
+        for (int b = 0; b < blocks; ++b) {
+            for (int i = 0; i < inputs; ++i)
+                std::memcpy(bank.InputBlock(id[static_cast<size_t>(i)]), &x[static_cast<size_t>(i)][static_cast<size_t>(b * block)], sizeof(float) * block);
+            bank.Process(&out[pass][static_cast<size_t>(b * block)], &out[pass][static_cast<size_t>(frames + b * block)], static_cast<uint64_t>(b));
+        }
+    }
+    const bool ok = std::memcmp(out[0].data(), out[1].data(), sizeof(float) * out[0].size()) == 0;
+    std::printf("%s parallel equals serial: bank output bit for bit\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 // The work of the long partitions is spread: no block does much more than the average.
 bool EvenWork() {
     const int block = 1024, length = 240000;
@@ -375,6 +407,7 @@ int main(int argc, char** argv) {
     ok &= MovedImpulses(128, 0, false, 78, true);
     ok &= MovedImpulses(201, 50, true, 79, true);
     ok &= AvxMatchesScalar();
+    ok &= ParallelMatchesSerial();
     ok &= EvenWork();
     std::printf(ok ? "all release convolver tests passed\n" : "release convolver tests FAILED\n");
     return ok ? 0 : 1;

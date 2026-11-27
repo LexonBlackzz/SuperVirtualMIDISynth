@@ -54,6 +54,11 @@ public:
         for (Chan& h : chan_) h = Chan{};
         Reset(0);
     }
+    // Threads for the convolutions (ConvBank::SetParallel).
+    void SetParallel(ConvBank::ParallelFn fn, void* user, uint32_t lanes) {
+        par_ = fn; parUser_ = user; lanes_ = lanes;
+        for (auto& g : groups_) g->bank.SetParallel(fn, user, lanes);
+    }
     uint32_t Block() const noexcept { return block_; }
     uint32_t Direct() const noexcept { return kDirectBlocks * block_; }
     // Off: every channel keeps a group of its own (the bus before groups; tests compare the two).
@@ -250,6 +255,7 @@ private:
         auto g = std::make_unique<Group>();
         g->pre[0].assign(block_, 0.0f); g->pre[1].assign(block_, 0.0f);
         g->dir[0].assign(ring_, 0.0f); g->dir[1].assign(ring_, 0.0f);
+        g->bank.SetParallel(par_, parUser_, lanes_);
         g->bank.Prepare(static_cast<int>(block_));
         groups_.push_back(std::move(g));
     }
@@ -504,6 +510,9 @@ private:
     uint64_t outFrom_ = 0;         // the next frame Render outputs
     bool share_ = true;
     bool level0_ = false;
+    ConvBank::ParallelFn par_ = nullptr;
+    void* parUser_ = nullptr;
+    uint32_t lanes_ = 1;
     std::vector<std::unique_ptr<Group>> groups_;
     Chan chan_[kChannels];
     uint64_t notes_ = 0, blocks_ = 0, convolved_ = 0, busNs_ = 0, moves_ = 0;

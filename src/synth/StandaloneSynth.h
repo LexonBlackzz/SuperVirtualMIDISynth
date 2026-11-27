@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -387,10 +388,11 @@ public:
     }
     void SetReleaseBusSharing(bool on) { bus_.SetSharing(on); }
     // A host that knows what is coming (the offline renderer) calls EnableBusLookahead before rendering, then gives
-    // every event from each render call's first frame to the returned frames past its end, sorted, before the
-    // call (SetBusLookahead), and clears it after. The bus pairs a note-on with a note-off that far ahead (the
-    // engine's pairing, run ahead: FeedAhead), so an eligible note shorter than its direct span never takes a voice,
-    // and its kernels keep level 0: such a note costs a correction of its held frames, not its first 8 blocks.
+    // the events up to the returned frames past each render call's end, sorted, before the call (SetBusLookahead;
+    // events an earlier call gave may be left out), and clears it after. The bus pairs a note-on with a note-off
+    // that far ahead (the engine's pairing, run ahead: FeedAhead), so an eligible note shorter than its direct span
+    // never takes a voice, and its kernels keep level 0: such a note costs a correction of its held frames, not its
+    // first 8 blocks.
     // Handoffs stop (a late impulse cannot join level 0). Without it, pairs stay within a call. 0: no bus.
     uint32_t EnableBusLookahead() {
         if (!busOn_) return 0u;
@@ -1317,6 +1319,7 @@ private:
 
     void StartBus() {
         bus_.Configure(busBlock_);
+        bus_.SetParallel(&RenderScalar::ParallelFor, &renderer_, renderer_.GetRenderThreadCount());
         bus_.SetSharing(std::getenv("SVMS_BUS_NO_SHARE") == nullptr);   // A/B runs: one group per channel
         keyHeld_.assign(size_t(kChannelCount) * kNoteCount, 0u);
         busOff_.assign(size_t(kChannelCount) * kNoteCount, UINT64_MAX);
@@ -1538,15 +1541,24 @@ private:
         const uint32_t key = uint32_t(channel) * kNoteCount + note;
         uint64_t off = 0;
         if (busAheadOn_) {
-            auto& pairs = busKeys_[key].pairs;
-            size_t found = SIZE_MAX, keep = 0;
-            for (size_t i = 0; i < pairs.size(); ++i) {
-                if (pairs[i].first < on) continue;   // its note-on is past (merged or refused): drop
-                if (found == SIZE_MAX && pairs[i].first == on) { found = i; off = pairs[i].second; continue; }
-                pairs[keep++] = pairs[i];
+            // Note-ons come in time order: a pair whose note-on is past (merged or refused) is dead, and is marked so
+            // as the scan passes it; the dead ones in front are skipped for good, so with FIFO pairing the match is
+            // the first one looked at.
+            BusKey& k = busKeys_[key];
+            auto& pairs = k.pairs;
+            bool found = false;
+            for (size_t i = k.head; i < pairs.size(); ++i) {
+                uint64_t& first = pairs[i].first;
+                if (first != kTaken && first < on) first = kTaken;
+                if (first == kTaken) { if (i == k.head) ++k.head; continue; }
+                if (first == on) { found = true; off = pairs[i].second; first = kTaken; if (i == k.head) ++k.head; break; }
             }
-            pairs.resize(keep);
-            if (found == SIZE_MAX || !bus_.Open(channel, on)) return false;
+            if (k.head == pairs.size()) { pairs.clear(); k.head = 0; }
+            else if (k.head > 64u && 2u * k.head > pairs.size()) {
+                pairs.erase(pairs.begin(), pairs.begin() + std::ptrdiff_t(k.head));
+                k.head = 0;
+            }
+            if (!found || !bus_.Open(channel, on)) return false;
         } else {
             if (keyHeld_[key] != 0u || !bus_.Open(channel, on)) return false;
             const auto it = std::lower_bound(busPlan_.begin(), busPlan_.end(), BusPair{key, on, 0u});
@@ -1569,7 +1581,11 @@ private:
         ++notes_;
         ++busNotes_;
         ++keyHeld_[key];
-        if (busAheadOn_) busKeys_[key].offs.push_back(off);
+        if (busAheadOn_) {
+            auto& offs = busKeys_[key].offs;
+            offs.push_back(off);
+            std::push_heap(offs.begin(), offs.end(), std::greater<uint64_t>());
+        }
         else busOff_[key] = off;
         return true;
     }
@@ -1579,11 +1595,12 @@ private:
         if (note >= kNoteCount || channel >= kChannelCount) return false;
         const uint32_t key = uint32_t(channel) * kNoteCount + note;
         if (busAheadOn_) {
+            // The earliest pending note-off; earlier ones never came (they can no longer match).
             auto& offs = busKeys_[key].offs;
-            const auto it = std::find(offs.begin(), offs.end(), busFrame_);
-            if (it == offs.end()) return false;
-            *it = offs.back();
-            offs.pop_back();
+            const auto pop = [&] { std::pop_heap(offs.begin(), offs.end(), std::greater<uint64_t>()); offs.pop_back(); };
+            while (!offs.empty() && offs.front() < busFrame_) pop();
+            if (offs.empty() || offs.front() != busFrame_) return false;
+            pop();
         } else {
             if (busOff_[key] != busFrame_) return false;
             busOff_[key] = UINT64_MAX;
@@ -2043,10 +2060,13 @@ private:
     bool busAheadOn_ = false;     // pairs come from the lookahead (FeedAhead), not the call
     uint64_t busAheadFront_ = 0;  // lookahead events before this frame are fed
     struct BusOpen { uint64_t on; uint32_t epoch; };
+    static constexpr uint64_t kTaken = UINT64_MAX;   // BusKey::pairs: taken, or its note-on is past
     struct BusKey {
         std::deque<BusOpen> open;                          // note-ons not yet ended, in order (lookahead time)
-        std::vector<std::pair<uint64_t, uint64_t>> pairs;  // (on, off) the bus can take, note-ons still to come
-        std::vector<uint64_t> offs;                        // note-offs of bus notes still to come
+        std::vector<std::pair<uint64_t, uint64_t>> pairs;  // (on, off) the bus can take, from `head` on; taken or past
+                                                           // ones have on = kTaken
+        size_t head = 0;
+        std::vector<uint64_t> offs;                        // note-offs of bus notes still to come, a min-heap
     };
     std::vector<BusKey> busKeys_;
     std::vector<uint32_t> keyHeld_;

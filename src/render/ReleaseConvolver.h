@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 #if (defined(_M_X64) || defined(__x86_64__)) && !defined(SVMS_XP_COMPAT)
@@ -478,8 +479,7 @@ public:
             L.m = m;
             L.size = 2 * m * block;
             L.fft = std::make_shared<const SplitFft>(L.size);
-            L.z.assign(static_cast<size_t>(L.size), Cf(0.0f, 0.0f));
-            L.ga = L.gb = L.z;
+            Scratch(L);
             L.out.assign(static_cast<size_t>(4 * m * block), 0.0f);
             levels_.push_back(std::move(L));
         }
@@ -488,6 +488,16 @@ public:
         inputs_.clear();
         free_.clear();
         used_ = 0;
+    }
+
+    // Threads for a chunk's work: `fn` runs job(context, i) for i in [0, jobs) and returns when all are done
+    // (null: serially). `lanes` is how many run at once. The sums keep their order, so the output is the same.
+    using ParallelFn = void (*)(void* user, uint32_t jobs, void (*job)(void* context, uint32_t index), void* context);
+    void SetParallel(ParallelFn fn, void* user, uint32_t lanes) {
+        par_ = fn;
+        parUser_ = user;
+        lanes_ = fn ? (std::max)(1u, lanes) : 1u;
+        for (Level& L : levels_) Scratch(L);
     }
 
     // A new input against `k` (which must outlive it); silent before now. Returns its id.
@@ -733,7 +743,7 @@ private:
     struct Level {
         int m = 1, size = 0;
         std::shared_ptr<const SplitFft> fft;
-        std::vector<Cf> z, ga, gb;
+        std::vector<std::vector<Cf>> z, ga, gb;   // per lane
         std::vector<std::vector<Cf>> acc;   // output spectra, chunk t in slot t % acc.size()
         std::vector<uint8_t> accLive;       // the slot holds products (else its contents are stale)
         std::vector<float> out;             // [parity][side][N], levels >= 1
@@ -762,6 +772,19 @@ private:
             for (int k = h; k < size; ++k) x[k] = -g[k];
         }
         std::memcpy(prev, g, sizeof(Cf) * static_cast<size_t>(size));
+    }
+
+    void Scratch(Level& L) const {
+        const std::vector<Cf> zero(static_cast<size_t>(L.size), Cf(0.0f, 0.0f));
+        L.z.assign(lanes_, zero);
+        L.ga.assign(lanes_, zero);
+        L.gb.assign(lanes_, zero);
+    }
+    // f(i) for i in [0, jobs), on the threads when there are two jobs or more.
+    template <class F> void Par(uint32_t jobs, F&& f) {
+        if (!par_ || jobs < 2u) { for (uint32_t i = 0; i < jobs; ++i) f(i); return; }
+        using Fn = std::remove_reference_t<F>;
+        par_(parUser_, jobs, [](void* c, uint32_t i) { (*static_cast<Fn*>(c))(i); }, &f);
     }
 
     // At least `need` accumulator slots; live ones keep their chunk (window [t, t + old size)).
@@ -801,34 +824,39 @@ private:
             if (loud) loudIds_.push_back(static_cast<uint32_t>(id));
             else Fold(in, lv, size, nullptr);
         }
-        Cf* z = L.z.data();
-        Cf* ga = L.ga.data();
-        Cf* gb = L.gb.data();
-        for (size_t q = 0; q < loudIds_.size(); q += 2) {
-            Input& a = inputs_[loudIds_[q]];
-            Input* b = q + 1 < loudIds_.size() ? &inputs_[loudIds_[q + 1]] : nullptr;
-            const uint64_t first = static_cast<uint64_t>(j * n);   // j >= 0: chunk j had input
-            for (int i = 0; i < n; ++i) {
-                const size_t r = static_cast<size_t>((first + static_cast<uint64_t>(i)) & mask);
-                z[i] = Cf(a.ring[r], b ? b->ring[r] : 0.0f);
+        // Each lane takes every lanes-th pair; the pairs touch distinct inputs.
+        const uint32_t pairs = static_cast<uint32_t>((loudIds_.size() + 1) / 2);
+        const uint32_t lanes = (std::min)(lanes_, pairs);
+        Par(lanes, [&](uint32_t lane) {
+            Cf* z = L.z[lane].data();
+            Cf* ga = L.ga[lane].data();
+            Cf* gb = L.gb[lane].data();
+            for (size_t q = 2 * size_t(lane); q < loudIds_.size(); q += 2 * size_t(lanes)) {
+                Input& a = inputs_[loudIds_[q]];
+                Input* b = q + 1 < loudIds_.size() ? &inputs_[loudIds_[q + 1]] : nullptr;
+                const uint64_t first = static_cast<uint64_t>(j * n);   // j >= 0: chunk j had input
+                for (int i = 0; i < n; ++i) {
+                    const size_t r = static_cast<size_t>((first + static_cast<uint64_t>(i)) & mask);
+                    z[i] = Cf(a.ring[r], b ? b->ring[r] : 0.0f);
+                }
+                std::fill(z + n, z + size, Cf(0.0f, 0.0f));
+                L.fft->Run(z, false);
+                if (!b) { Fold(a, lv, size, z); continue; }
+                // Bin -k of position p sits at SplitFft::Partner(p): mirrored within each octave of positions.
+                const auto split = [&](int p, int q2) {
+                    const Cf zk = z[p], zc = std::conj(z[q2]);
+                    ga[p] = 0.5f * (zk + zc);
+                    const Cf d = zk - zc;
+                    gb[p] = Cf(0.5f * d.imag(), -0.5f * d.real());
+                };
+                split(0, 0);
+                split(1, 1);
+                for (int lo = 2; lo < size; lo <<= 1)
+                    for (int p = lo; p < 2 * lo; ++p) split(p, 3 * lo - 1 - p);
+                Fold(a, lv, size, ga);
+                Fold(*b, lv, size, gb);
             }
-            std::fill(z + n, z + size, Cf(0.0f, 0.0f));
-            L.fft->Run(z, false);
-            if (!b) { Fold(a, lv, size, z); continue; }
-            // Bin -k of position p sits at SplitFft::Partner(p): mirrored within each octave of positions.
-            const auto split = [&](int p, int q) {
-                const Cf zk = z[p], zc = std::conj(z[q]);
-                ga[p] = 0.5f * (zk + zc);
-                const Cf d = zk - zc;
-                gb[p] = Cf(0.5f * d.imag(), -0.5f * d.real());
-            };
-            split(0, 0);
-            split(1, 1);
-            for (int lo = 2; lo < size; lo <<= 1)
-                for (int p = lo; p < 2 * lo; ++p) split(p, 3 * lo - 1 - p);
-            Fold(a, lv, size, ga);
-            Fold(*b, lv, size, gb);
-        }
+        });
         // The products, scattered. Slots a product reaches for the first time start from zero.
         liveIds_.clear();
         size_t need = 1;
@@ -849,7 +877,9 @@ private:
                 L.accLive[s] = 1u;
             }
         }
-        for (int k0 = 0; k0 < size; k0 += kTile) {
+        // Tiles of bins are independent: one job each.
+        Par(liveIds_.empty() ? 0u : static_cast<uint32_t>((size + kTile - 1) / kTile), [&](uint32_t tile) {
+            const int k0 = static_cast<int>(tile) * kTile;
             const int count = (std::min)(kTile, size - k0);
             for (const uint32_t id : liveIds_) {
                 const Input& in = inputs_[id];
@@ -861,7 +891,7 @@ private:
                     Mul(reinterpret_cast<float*>(acc), xf, reinterpret_cast<const float*>(h), count, true);
                 }
             }
-        }
+        });
         // Output chunk t is complete.
         const size_t s = static_cast<size_t>(t % slots);
         if (!L.accLive[s]) return false;
@@ -878,6 +908,9 @@ private:
     }
 
     int block_ = 0, ring_ = 1, used_ = 0;
+    ParallelFn par_ = nullptr;
+    void* parUser_ = nullptr;
+    uint32_t lanes_ = 1;
     std::vector<Level> levels_;
     std::vector<Input> inputs_;
     std::vector<int> free_;

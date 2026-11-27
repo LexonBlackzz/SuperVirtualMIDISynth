@@ -767,7 +767,7 @@ public:
     virtual bool RenderEvents(const RealtimeEvent*, size_t, float*, float*,
                               uint32_t, uint64_t) { return false; }
     // The release bus's lookahead (StandaloneSynth::EnableBusLookahead, SetBusLookahead): turns it on and says how
-    // far past a call it wants events (0: none); then those events, from the call's first frame, for the next
+    // far past a call it wants events (0: none); then those events (the ones not given before), for the next
     // RenderEvents call only.
     virtual uint32_t EnableBusLookahead() { return 0u; }
     virtual void SetBusLookahead(const RealtimeEvent*, size_t) {}
@@ -830,6 +830,7 @@ public:
     }
     void ReleaseAll() override { synth_.ReleaseAll(); }
     void SetRawMix(bool raw) { synth_.SetRawMix(raw); }
+    bool BusOn() const { return synth_.ReleaseBusOn(); }
     float StealLevel(uint8_t ch, uint8_t key) const { return synth_.StealLevel(ch, key); }
     uint32_t VoiceCount(uint8_t ch, uint8_t key) const { return synth_.VoiceCount(ch, key); }
     void PostProcess(float* l, float* r, uint32_t n) { synth_.PostProcess(l, r, n); }
@@ -910,6 +911,9 @@ public:
         for (uint32_t i = 0; i < n; ++i)
             if (!ok[i]) { error = errors[i]; return false; }
         for (auto& s : shards_) s->SetRawMix(true);
+        // With the release bus, a key goes to one shard whatever its channel: channels of one mix share a key's
+        // convolution, and split by channel each shard would convolve every key.
+        busKeys_ = shards_[0]->BusOn();
         mine_.resize(n);
         ahead_s_.resize(n);
         filterNs_.assign(n, 0); renderNs_.assign(n, 0); keptEvents_.assign(n, 0);
@@ -992,7 +996,8 @@ private:
         const RealtimeEvent* ahead; size_t aheadCount;
     };
 
-    static uint32_t ShardFor(uint32_t channel, uint32_t note, uint32_t n) {
+    static uint32_t ShardFor(uint32_t channel, uint32_t note, uint32_t n, bool keyOnly) {
+        if (keyOnly) channel = 0u;
         return (((channel * 128u + note) * 2654435761u) >> 16u) % n;
     }
     void RunShard(uint32_t index) {
@@ -1003,7 +1008,7 @@ private:
             const uint8_t status = static_cast<uint8_t>(e.message);
             const uint8_t type = status & 0xf0u;
             return e.reset || (type != 0x80u && type != 0x90u) || IsInternalEngineMessage(e.message) ||
-                   ShardFor(status & 0x0fu, (e.message >> 8u) & 0x7fu, n) == index;
+                   ShardFor(status & 0x0fu, (e.message >> 8u) & 0x7fu, n, busKeys_) == index;
         };
         mine.clear();
         for (size_t i = 0; i < job_.count; ++i)
@@ -1048,6 +1053,7 @@ private:
     std::vector<std::vector<RealtimeEvent>> mine_;
     std::vector<std::vector<RealtimeEvent>> ahead_s_;   // each shard's part of the bus lookahead
     const RealtimeEvent* ahead_ = nullptr;
+    bool busKeys_ = false;
     size_t aheadCount_ = 0;
     std::vector<std::vector<float>> planeL_, planeR_;
     std::vector<uint64_t> filterNs_, renderNs_, keptEvents_;
@@ -1785,12 +1791,14 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
         // The release bus pairs notes up to this far past a block: events are read that far ahead and handed to
         // it with each block (none with jitter, which reorders them).
         const uint64_t lookahead = jitterFrames ? 0u : synth->EnableBusLookahead();
-        std::vector<RealtimeEvent> ahead, look;   // ahead: read, at or past the block's end, from aheadAt on
+        // ahead: read, at or past the block's end, from aheadAt on; fresh: read for this block (what the bus has not seen)
+        std::vector<RealtimeEvent> ahead, fresh;
         size_t aheadAt = 0;
         while (ioOk && !pollCancel() && frame < maxFrames) {
             uint32_t n = o.blockFrames;
             const uint64_t limit = frame + n;
             block.clear();
+            fresh.clear();
             bool exhausted = false;
             if (jitterFrames != 0u) {
                 // Diagnostic: delay every event by 0..jitterFrames frames, as a
@@ -1835,6 +1843,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
                     countSourceEvent(event);
                     ++events;
                     const RealtimeEvent e{event.outputFrame, event.sequence, event.message, false};
+                    if (lookahead != 0u) fresh.push_back(e);
                     if (e.targetFrame < limit && aheadAt == ahead.size()) block.push_back(e);
                     else ahead.push_back(e);
                 }
@@ -1850,9 +1859,7 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
                     block.pop_back();
             }
             if (lookahead != 0u) {
-                look.assign(block.begin(), block.end());
-                look.insert(look.end(), ahead.begin() + static_cast<std::ptrdiff_t>(aheadAt), ahead.end());
-                synth->SetBusLookahead(look.data(), look.size());
+                synth->SetBusLookahead(fresh.data(), fresh.size());
                 if (aheadAt == ahead.size()) { ahead.clear(); aheadAt = 0; }
                 else if (aheadAt > 4096u && 2u * aheadAt > ahead.size()) {
                     ahead.erase(ahead.begin(), ahead.begin() + static_cast<std::ptrdiff_t>(aheadAt));

@@ -449,6 +449,11 @@ public:
     bool ConfigureRenderThreads(uint32_t totalRenderThreads,
                                 uint32_t maximumBlockFrames);
     uint32_t GetRenderThreadCount() const;
+    // Runs job(context, i) for i in [0, jobCount) on the render threads (serially without them); between blocks.
+    static void ParallelFor(void* renderer, uint32_t jobCount, void (*job)(void* context, uint32_t index),
+                            void* context) {
+        PlanParallelFor(renderer, jobCount, job, context);
+    }
     float GetMulticoreEffectiveness() const {
         return workerPool_ ? workerPool_->GetHelperJobPercent() : 0.0f;
     }
