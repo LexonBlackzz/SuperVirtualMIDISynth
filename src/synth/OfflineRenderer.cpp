@@ -771,6 +771,18 @@ public:
     // RenderEvents call only.
     virtual uint32_t EnableBusLookahead() { return 0u; }
     virtual void SetBusLookahead(const RealtimeEvent*, size_t) {}
+    // Pipelined blocks (batched path): Stage hands over the next block's events and bus lookahead, which must stay
+    // valid until its Wait, and may be called while the previous block still renders; Wait returns once the block
+    // last started is done (call it before reading the output or anything else of the session); Start renders the
+    // staged block into left/right. Here Start renders it at once; a session may return before it is done.
+    virtual void Stage(const RealtimeEvent* events, size_t count, const RealtimeEvent* ahead, size_t aheadCount) {
+        stagedEvents_ = events; stagedCount_ = count; stagedAhead_ = ahead; stagedAheadCount_ = aheadCount;
+    }
+    virtual void Start(float* left, float* right, uint32_t frames, uint64_t frame) {
+        if (stagedAhead_ || stagedAheadCount_) SetBusLookahead(stagedAhead_, stagedAheadCount_);
+        RenderEvents(stagedEvents_, stagedCount_, left, right, frames, frame);
+    }
+    virtual void Wait() {}
     // Cumulative whole-voice phase cycles {plan, jobs, post}; zeros if unknown.
     virtual void PhaseCycles(uint64_t (&out)[3]) const { out[0] = out[1] = out[2] = 0; }
     // {note-on collapse coalesced, re-excited, exact-merge folded}
@@ -791,6 +803,11 @@ public:
     virtual uint64_t InvalidRegions() const = 0;
     virtual uint64_t FallbackRegions() const = 0;
     virtual const char* Backend() const = 0;
+protected:
+    const RealtimeEvent* stagedEvents_ = nullptr;
+    size_t stagedCount_ = 0;
+    const RealtimeEvent* stagedAhead_ = nullptr;
+    size_t stagedAheadCount_ = 0;
 };
 
 // The default session: the shared StandaloneSynth plus the realtime block
@@ -884,12 +901,15 @@ private:
 class ShardedOfflineSession final : public OfflineSessionSynth {
 public:
     ~ShardedOfflineSession() override {
+        Wait();
         StopWorkers();
-        if (std::getenv("SVMS_OFFLINE_PROFILE"))
+        if (std::getenv("SVMS_OFFLINE_PROFILE")) {
+            std::fprintf(stderr, "\n[shards] splitting events %.2fs", stageNs_ * 1e-9);
             for (size_t i = 0; i < filterNs_.size(); ++i)
                 std::fprintf(stderr, "\n[shard %zu] filter %.2fs render %.2fs events %llu",
                              i, filterNs_[i] * 1e-9, renderNs_[i] * 1e-9,
                              (unsigned long long)keptEvents_[i]);
+        }
     }
     bool Initialize(const Options& o, std::string& error) override {
         const uint32_t n = o.shards;
@@ -914,24 +934,25 @@ public:
         // With the release bus, a key goes to one shard whatever its channel: channels of one mix share a key's
         // convolution, and split by channel each shard would convolve every key.
         busKeys_ = shards_[0]->BusOn();
-        mine_.resize(n);
-        ahead_s_.resize(n);
+        for (int b = 0; b < 2; ++b) { mine_[b].resize(n); ahead_s_[b].resize(n); }
         filterNs_.assign(n, 0); renderNs_.assign(n, 0); keptEvents_.assign(n, 0);
         planeL_.resize(n); planeR_.resize(n);
-        for (uint32_t i = 1; i < n; ++i) {
-            planeL_[i].resize(o.blockFrames); planeR_[i].resize(o.blockFrames);
+        // Every shard on a worker (shard 0 too), so the caller can read and split the next block meanwhile.
+        for (uint32_t i = 0; i < n; ++i) {
+            if (i) { planeL_[i].resize(o.blockFrames); planeR_[i].resize(o.blockFrames); }
             workers_.emplace_back([this, i] { WorkerLoop(i); });
         }
         return true;
     }
     void Dispatch(uint32_t message, uint64_t frame) override {
+        Wait();
         for (auto& s : shards_) s->Dispatch(message, frame);
     }
     void Render(float* left, float* right, uint32_t frames,
                 uint64_t absoluteFrame) override {
         RenderEvents(nullptr, 0, left, right, frames, absoluteFrame);
     }
-    void ReleaseAll() override { for (auto& s : shards_) s->ReleaseAll(); }
+    void ReleaseAll() override { Wait(); for (auto& s : shards_) s->ReleaseAll(); }
     uint32_t EnableBusLookahead() override {
         uint32_t frames = 0;
         for (auto& s : shards_) frames = s->EnableBusLookahead();
@@ -941,9 +962,40 @@ public:
     bool RenderEvents(const RealtimeEvent* events, size_t count, float* left,
                       float* right, uint32_t frames, uint64_t frame) override {
         if (!left) return true;  // capability probe
-        job_ = {events, count, frames, frame, ahead_, aheadCount_};
+        Stage(events, count, ahead_, aheadCount_);
         ahead_ = nullptr;
         aheadCount_ = 0;
+        Start(left, right, frames, frame);
+        Wait();
+        return true;
+    }
+    // Splits the block's events between the shards, once: note events to the shard of their key, the rest to
+    // every shard. Into the buffers the running block does not use.
+    void Stage(const RealtimeEvent* events, size_t count, const RealtimeEvent* ahead, size_t aheadCount) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint32_t n = static_cast<uint32_t>(shards_.size());
+        const auto split = [&](const RealtimeEvent* from, size_t c, std::vector<std::vector<RealtimeEvent>>& to) {
+            for (auto& v : to) v.clear();
+            for (size_t i = 0; i < c; ++i) {
+                const RealtimeEvent& e = from[i];
+                const uint8_t status = static_cast<uint8_t>(e.message);
+                const uint8_t type = status & 0xf0u;
+                if (e.reset || (type != 0x80u && type != 0x90u) || IsInternalEngineMessage(e.message)) {
+                    for (auto& v : to) v.push_back(e);
+                } else {
+                    to[ShardFor(status & 0x0fu, (e.message >> 8u) & 0x7fu, n, busKeys_)].push_back(e);
+                }
+            }
+        };
+        split(events, count, mine_[staged_]);
+        split(ahead, aheadCount, ahead_s_[staged_]);
+        aheadSet_[staged_] = aheadCount != 0;
+        stageNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    }
+    void Start(float* left, float* right, uint32_t frames, uint64_t frame) override {
+        Wait();
+        job_ = {staged_, frames, frame};
+        staged_ ^= 1;
         outL_ = left; outR_ = right;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -951,18 +1003,21 @@ public:
             ++generation_;
         }
         wake_.notify_all();
-        RunShard(0);
+        inFlight_ = true;
+    }
+    void Wait() override {
+        if (!inFlight_) return;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             done_.wait(lock, [&] { return pending_ == 0; });
         }
+        inFlight_ = false;
         for (size_t i = 1; i < shards_.size(); ++i)
-            for (uint32_t f = 0; f < frames; ++f) {
-                left[f] += planeL_[i][f];
-                right[f] += planeR_[i][f];
+            for (uint32_t f = 0; f < job_.frames; ++f) {
+                outL_[f] += planeL_[i][f];
+                outR_[f] += planeR_[i][f];
             }
-        shards_[0]->PostProcess(left, right, frames);
-        return true;
+        shards_[0]->PostProcess(outL_, outR_, job_.frames);
     }
     void PhaseCycles(uint64_t (&out)[3]) const override {
         out[0] = out[1] = out[2] = 0;
@@ -991,33 +1046,17 @@ public:
 #undef SVMS_SHARD_SUM
     const char* Backend() const override { return shards_[0]->Backend(); }
 private:
-    struct Job {
-        const RealtimeEvent* events; size_t count; uint32_t frames; uint64_t frame;
-        const RealtimeEvent* ahead; size_t aheadCount;
-    };
+    struct Job { int buf; uint32_t frames; uint64_t frame; };
 
     static uint32_t ShardFor(uint32_t channel, uint32_t note, uint32_t n, bool keyOnly) {
         if (keyOnly) channel = 0u;
         return (((channel * 128u + note) * 2654435761u) >> 16u) % n;
     }
     void RunShard(uint32_t index) {
-        const uint32_t n = static_cast<uint32_t>(shards_.size());
-        auto& mine = mine_[index];
+        auto& mine = mine_[job_.buf][index];
         const auto t0 = std::chrono::steady_clock::now();
-        const auto ours = [&](const RealtimeEvent& e) {
-            const uint8_t status = static_cast<uint8_t>(e.message);
-            const uint8_t type = status & 0xf0u;
-            return e.reset || (type != 0x80u && type != 0x90u) || IsInternalEngineMessage(e.message) ||
-                   ShardFor(status & 0x0fu, (e.message >> 8u) & 0x7fu, n, busKeys_) == index;
-        };
-        mine.clear();
-        for (size_t i = 0; i < job_.count; ++i)
-            if (ours(job_.events[i])) mine.push_back(job_.events[i]);
-        auto& ahead = ahead_s_[index];
-        ahead.clear();
-        for (size_t i = 0; i < job_.aheadCount; ++i)
-            if (ours(job_.ahead[i])) ahead.push_back(job_.ahead[i]);
-        if (job_.aheadCount) shards_[index]->SetBusLookahead(ahead.data(), ahead.size());
+        auto& ahead = ahead_s_[job_.buf][index];
+        if (aheadSet_[job_.buf]) shards_[index]->SetBusLookahead(ahead.data(), ahead.size());
         float* l = index == 0 ? outL_ : planeL_[index].data();
         float* r = index == 0 ? outR_ : planeR_[index].data();
         const auto t1 = std::chrono::steady_clock::now();
@@ -1050,8 +1089,12 @@ private:
     }
 
     std::vector<std::unique_ptr<LegacyOfflineSession>> shards_;
-    std::vector<std::vector<RealtimeEvent>> mine_;
-    std::vector<std::vector<RealtimeEvent>> ahead_s_;   // each shard's part of the bus lookahead
+    // Per buffer (the running block's and the one being staged): each shard's events and part of the bus lookahead.
+    std::vector<std::vector<RealtimeEvent>> mine_[2], ahead_s_[2];
+    bool aheadSet_[2] = {false, false};
+    int staged_ = 0;
+    bool inFlight_ = false;
+    uint64_t stageNs_ = 0;
     const RealtimeEvent* ahead_ = nullptr;
     bool busKeys_ = false;
     size_t aheadCount_ = 0;
@@ -1775,7 +1818,6 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
     const bool truncated = o.maxSeconds && maxFrames < info.totalFrames;
     PackedMidiEvent event{};
     if (batched) {
-        std::vector<RealtimeEvent> block;
         const uint32_t jitterFrames = [] {
             const char* v = std::getenv("SVMS_OFFLINE_JITTER_FRAMES");
             return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
@@ -1792,11 +1834,33 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
         // it with each block (none with jitter, which reorders them).
         const uint64_t lookahead = jitterFrames ? 0u : synth->EnableBusLookahead();
         // ahead: read, at or past the block's end, from aheadAt on; fresh: read for this block (what the bus has not seen)
-        std::vector<RealtimeEvent> ahead, fresh;
+        std::vector<RealtimeEvent> ahead, freshes[2], blocks[2];
         size_t aheadAt = 0;
-        while (ioOk && !pollCancel() && frame < maxFrames) {
+        // Pipelined: block k + 1 is read and staged while block k renders (Stage, Wait, Start), so reading the
+        // events and splitting them between shards is off the render's path. `frame` is the next frame written,
+        // `readFrame` the next one read.
+        std::vector<float> outs[2][2];
+        for (auto& o2 : outs) for (auto& v : o2) v.resize(o.blockFrames);
+        int cur = 0, flight = -1;
+        uint32_t flightFrames = 0;
+        auto dspStart = std::chrono::steady_clock::now();
+        const auto finish = [&] {   // the block in flight is done: write it
+            synth->Wait();
+            renderNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - dspStart).count());
+            ioOk = wave.Write(outs[flight][0].data(), outs[flight][1].data(), flightFrames);
+            frame += flightFrames;
+            peakVoices = (std::max)(peakVoices, synth->Active());
+            reportRender(false);
+            flight = -1;
+        };
+        uint64_t readFrame = frame;
+        while (ioOk && !pollCancel() && readFrame < maxFrames) {
+            std::vector<RealtimeEvent>& block = blocks[cur];
+            std::vector<RealtimeEvent>& fresh = freshes[cur];
             uint32_t n = o.blockFrames;
-            const uint64_t limit = frame + n;
+            const uint64_t limit = readFrame + n;
             block.clear();
             fresh.clear();
             bool exhausted = false;
@@ -1852,31 +1916,31 @@ static int RenderOne(svms::Options o, const svms::EngineConfig& engineConfig,
             if (exhausted) {
                 // Decoder finished: the total is now exact. Events sitting
                 // exactly on the final frame fall outside the last block.
-                if (frame >= info.totalFrames) break;
+                if (readFrame >= info.totalFrames) break;
                 n = static_cast<uint32_t>(
-                    (std::min<uint64_t>)(n, info.totalFrames - frame));
-                while (!block.empty() && block.back().targetFrame >= frame + n)
+                    (std::min<uint64_t>)(n, info.totalFrames - readFrame));
+                while (!block.empty() && block.back().targetFrame >= readFrame + n)
                     block.pop_back();
             }
             if (lookahead != 0u) {
-                synth->SetBusLookahead(fresh.data(), fresh.size());
                 if (aheadAt == ahead.size()) { ahead.clear(); aheadAt = 0; }
                 else if (aheadAt > 4096u && 2u * aheadAt > ahead.size()) {
                     ahead.erase(ahead.begin(), ahead.begin() + static_cast<std::ptrdiff_t>(aheadAt));
                     aheadAt = 0;
                 }
             }
-            const auto dspStart = std::chrono::steady_clock::now();
-            synth->RenderEvents(block.data(), block.size(), left.data(),
-                                right.data(), n, frame);
-            renderNs += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - dspStart).count());
-            ioOk = wave.Write(left.data(), right.data(), n);
-            frame += n;
-            peakVoices = (std::max)(peakVoices, synth->Active());
-            reportRender(false);
+            synth->Stage(block.data(), block.size(), lookahead != 0u ? fresh.data() : nullptr,
+                         lookahead != 0u ? fresh.size() : 0u);
+            if (flight >= 0) finish();
+            if (!ioOk || pollCancel()) break;
+            dspStart = std::chrono::steady_clock::now();
+            synth->Start(outs[cur][0].data(), outs[cur][1].data(), n, readFrame);
+            flight = cur;
+            flightFrames = n;
+            readFrame += n;
+            cur ^= 1;
         }
+        if (flight >= 0) finish();
     }
     while (!batched && ioOk && !pollCancel()) {
         bool have = false;
